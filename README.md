@@ -20,7 +20,7 @@ It’s useful when you want to execute multiple steps in order, handle failures 
 ## 📦 Installation
 
 ```bash
-go get github.com/yourusername/flowm
+go get github.com/bi0dread/flowm
 ```
 
 ---
@@ -35,7 +35,7 @@ import (
     "fmt"
     "time"
 
-    "github.com/yourusername/flowm"
+    "github.com/bi0dread/flowm"
 )
 
 func step1(msg string) error {
