@@ -49,9 +49,9 @@ type logPolicy struct {
 	logs *[]string
 }
 
-func (l logPolicy) Do(action Action, err error) error {
+func (l logPolicy) Do(action Action, err error) (any, error) {
 	*l.logs = append(*l.logs, fmt.Sprintf("Policy executed for %T with err: %v", action.Func, err))
-	return err
+	return nil, err
 }
 
 func TestFlowm_BasicExecution(t *testing.T) {
@@ -127,6 +127,31 @@ func TestFlowm_TerminatePolicy_Skip(t *testing.T) {
 		t.Errorf("Expected error due to termination, got: %v", err)
 	}
 
+}
+
+func TestFlowm_PassValuePolicy_Skip(t *testing.T) {
+	f := New()
+
+	pass := &PassValuesPolicy{}
+
+	f.AddAction(NewAction(FunctionWithReturnValue, nil, pass))
+	f.AddAction(NewAction(FunctionWithParams, nil))
+
+	err := f.Start()
+	if err == nil {
+		fmt.Println("terminate policy should skip execution")
+	} else {
+		t.Errorf("Expected error due to termination, got: %v", err)
+	}
+
+}
+
+func FunctionWithReturnValue() string {
+	return "Hello World"
+}
+
+func FunctionWithParams(value string) {
+	fmt.Println("i got :" + value)
 }
 
 func TestFlowm_DoNotRetry(t *testing.T) {

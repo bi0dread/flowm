@@ -17,8 +17,8 @@ type Action struct {
 }
 
 type stub struct {
-	Name  string
-	Order int
+	Name   string
+	Action Action
 }
 
 type Flowm interface {
@@ -27,36 +27,56 @@ type Flowm interface {
 }
 
 type flowm struct {
-	stubStorage map[stub]Action
+	stubStorage []stub
 }
 
 func New() Flowm {
 	return &flowm{
-		stubStorage: make(map[stub]Action),
+		stubStorage: make([]stub, 0),
 	}
 }
 
 func (f *flowm) AddAction(act Action) {
 	name, _ := f.getFunctionName(act.Func)
-	f.stubStorage[stub{Name: name, Order: len(f.stubStorage)}] = act
+	f.stubStorage = append(f.stubStorage, stub{Name: name, Action: act})
 }
 
 func (f *flowm) Start() error {
-	for stu, act := range f.stubStorage {
-		_, err := f.call(stu.Name, stu.Order, act.Params...)
+
+	var res []interface{}
+	res = nil
+	keepValue := false
+
+	for i, act := range f.stubStorage {
+
+		if res != nil && keepValue {
+			if act.Action.Params == nil {
+				act.Action.Params = []interface{}{}
+			}
+			act.Action.Params = append(act.Action.Params, res...)
+			keepValue = false
+			res = nil
+		}
+
+		result, err := f.call(i, act.Action.Params...)
 
 		skipErr := false
 
-		for _, policy := range act.Policies {
-			_ = policy.Do(act, err)
+		for _, policy := range act.Action.Policies {
+			_, _ = policy.Do(act.Action, err)
 			if p, ok := policy.(*TerminatePolicy); ok && p.Terminate {
 				skipErr = true
+			}
+			if _, ok := policy.(*PassValuesPolicy); ok {
+
+				res = result
+				keepValue = true
 			}
 		}
 
 		if err != nil {
 			if skipErr {
-				fmt.Printf("Skipping error for %s: %v\n", stu.Name, err)
+				fmt.Printf("Skipping error for %s: %v\n", act.Name, err)
 				continue
 			} else {
 				return err
@@ -76,12 +96,9 @@ func NewAction(function interface{}, Params []interface{}, Policy ...Policy) Act
 	}
 }
 
-func (f *flowm) call(funcName string, order int, params ...interface{}) (result []interface{}, err error) {
+func (f *flowm) call(funcName int, params ...interface{}) (result []interface{}, err error) {
 
-	return callReflect(f.stubStorage[stub{
-		Name:  funcName,
-		Order: order,
-	}].Func, params...)
+	return callReflect(f.stubStorage[funcName].Action.Func, params...)
 
 }
 
@@ -131,7 +148,7 @@ func (f *flowm) getFunctionName(i interface{}) (name string, isMethod bool) {
 }
 
 type Policy interface {
-	Do(action Action, err error) error
+	Do(action Action, err error) (any, error)
 }
 
 type RetryPolicy struct {
@@ -143,22 +160,31 @@ type RetryPolicy struct {
 	Fn            func() error
 }
 
+type PassValuesPolicy struct {
+	Value interface{}
+}
+
+func (r *PassValuesPolicy) Do(action Action, mainErr error) (any, error) {
+
+	return nil, mainErr
+}
+
 type TerminatePolicy struct {
 	Terminate bool
 }
 
-func (r *TerminatePolicy) Do(action Action, mainErr error) error {
+func (r *TerminatePolicy) Do(action Action, mainErr error) (any, error) {
 
-	return mainErr
+	return nil, mainErr
 }
 
-func (r *RetryPolicy) Do(action Action, mainErr error) error {
+func (r *RetryPolicy) Do(action Action, mainErr error) (any, error) {
 
 	if mainErr != nil {
 
 		if _, ok := mainErr.(DoNotRetry); ok {
 			fmt.Println("Do not retry due to DoNotRetry error")
-			return nil
+			return nil, nil
 		}
 
 		var err error
@@ -168,7 +194,7 @@ func (r *RetryPolicy) Do(action Action, mainErr error) error {
 			if r.Fn != nil {
 				err = r.Fn()
 				if err != nil {
-					return nil
+					return nil, nil
 				}
 			}
 
@@ -189,7 +215,7 @@ func (r *RetryPolicy) Do(action Action, mainErr error) error {
 				//fmt.Println(callErr.Error())
 			} else {
 				fmt.Println("Retry success")
-				return nil
+				return nil, nil
 			}
 
 			if attempt == r.Attempts {
@@ -202,10 +228,10 @@ func (r *RetryPolicy) Do(action Action, mainErr error) error {
 
 		}
 
-		return err
+		return nil, err
 	}
 
-	return mainErr
+	return nil, mainErr
 
 }
 
