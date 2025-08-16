@@ -22,6 +22,12 @@ type retryCounter struct {
 	count int
 }
 
+func doFail() error {
+
+	fmt.Println("do fail")
+	return errors.New("this is test error")
+}
+
 func (r *retryCounter) failUntil(threshold int) error {
 	r.count++
 	if r.count < threshold {
@@ -100,6 +106,27 @@ func TestFlowm_RetryPolicy_Failure(t *testing.T) {
 	if rc.count != 2 {
 		t.Errorf("Expected 2 attempts, got %d", rc.count)
 	}
+}
+
+func TestFlowm_TerminatePolicy_Skip(t *testing.T) {
+	f := New()
+
+	retry := &RetryPolicy{
+		Attempts: 2,
+		Delay:    5 * time.Millisecond,
+	}
+
+	terminate := &TerminatePolicy{Terminate: true}
+
+	f.AddAction(NewAction(doFail, nil, retry, terminate))
+
+	err := f.Start()
+	if err == nil {
+		fmt.Println("terminate policy should skip execution")
+	} else {
+		t.Errorf("Expected error due to termination, got: %v", err)
+	}
+
 }
 
 func TestFlowm_DoNotRetry(t *testing.T) {

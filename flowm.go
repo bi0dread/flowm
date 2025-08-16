@@ -45,12 +45,23 @@ func (f *flowm) Start() error {
 	for stu, act := range f.stubStorage {
 		_, err := f.call(stu.Name, stu.Order, act.Params...)
 
+		skipErr := false
+
 		for _, policy := range act.Policies {
 			_ = policy.Do(act, err)
+			if p, ok := policy.(*TerminatePolicy); ok && p.Terminate {
+				skipErr = true
+			}
 		}
 
 		if err != nil {
-			return err
+			if skipErr {
+				fmt.Printf("Skipping error for %s: %v\n", stu.Name, err)
+				continue
+			} else {
+				return err
+
+			}
 		}
 	}
 
@@ -130,6 +141,15 @@ type RetryPolicy struct {
 	BackoffFactor float64
 	Jitter        bool
 	Fn            func() error
+}
+
+type TerminatePolicy struct {
+	Terminate bool
+}
+
+func (r *TerminatePolicy) Do(action Action, mainErr error) error {
+
+	return mainErr
 }
 
 func (r *RetryPolicy) Do(action Action, mainErr error) error {
