@@ -1,19 +1,24 @@
 # Flowm – Go Function Flow Manager with Policies
 
-Flowm is a simple and extensible Go package for managing sequences of function calls ("actions") with optional **policies** such as retries, backoff, and conditional execution rules.  
-
-It’s useful when you want to execute multiple steps in order, handle failures gracefully, and optionally retry failed actions with configurable policies.
+Flowm is a simple and extensible Go package for managing sequences of function calls ("actions") with optional policies such as retries, backoff, timeouts, rate limiting, circuit breakers, and conditional execution.
 
 ---
 
 ## ✨ Features
 
-- **Sequential Action Execution** – Run functions in the order you define.
-- **Policy System** – Attach policies (e.g., retries with backoff) to actions.
+- **Sequential Action Execution** – Run functions in order.
+- **Context Propagation** – `WithContext(ctx)` injects `context.Context` into actions that accept it.
+- **Policy System** – Attach policies (retries, timeouts, rate limits, circuit breakers, etc.).
 - **Dynamic Function Calling** – Use reflection to call arbitrary functions with parameters.
-- **Error-Aware Flow Control** – Stop execution if an error occurs (unless policies handle it).
-- **Retry Support** – Configurable attempts, delay, max delay, backoff factor, and jitter.
-- **Pluggable Policies** – Create your own policies by implementing the `Policy` interface.
+- **Error Control** – Stop on error by default, or continue via `ContinueOnErrorPolicy`.
+- **Retry Support** – Attempts (total), delay, max delay, backoff, jitter, predicate (`RetryIf`), max elapsed.
+- **Timeouts** – `TimeoutPolicy{PerAttempt}` to bound each call.
+- **Piping Outputs** – `PipeAll()`, `Pipe(indices...)`, `Map(fn)` to pass outputs to next action.
+- **Parallel Groups** – `AddParallel(actions...)` with optional `WorkerPoolPolicy{Size}`.
+- **Rate Limiting** – `RateLimitPolicy{Per, Burst}` token-bucket style.
+- **Circuit Breaker** – `CircuitBreakerPolicy{Failures, Window, Cooldown}`.
+- **Observability Hooks** – `WithHooks(Hooks{OnStart, OnSuccess, OnError, OnRetry})`.
+- **Fluent Builder API** – `New().Do(...).With(...).PipeAll().ContinueOnError().Start()`.
 
 ---
 
@@ -28,41 +33,19 @@ go get github.com/bi0dread/flowm
 ## 🚀 Quick Start
 
 ```go
-package main
+f := flowm.New().WithContext(context.Background())
 
-import (
-    "errors"
-    "fmt"
-    "time"
-
-    "github.com/bi0dread/flowm"
-)
-
-func step1(msg string) error {
-    fmt.Println("Step 1:", msg)
-    return errors.New("fail once")
+retry := &flowm.RetryPolicy{
+    Attempts:      3,              // total attempts including the original call
+    Delay:         500 * time.Millisecond,
+    BackoffFactor: 2.0,
+    Jitter:        true,
 }
 
-func step2() {
-    fmt.Println("Step 2: Success!")
-}
+f.Do(step1, "Hello").With(retry).PipeAll().Do(step2)
 
-func main() {
-    f := flowm.New()
-
-    retryPolicy := &flowm.RetryPolicy{
-        Attempts:      3,
-        Delay:         1 * time.Second,
-        BackoffFactor: 2.0,
-        Jitter:        true,
-    }
-
-    f.AddAction(flowm.NewAction(step1, []interface{}{"Hello"}, retryPolicy))
-    f.AddAction(flowm.NewAction(step2, []interface{}{}))
-
-    if err := f.Start(); err != nil {
-        fmt.Println("Flow ended with error:", err)
-    }
+if err := f.Start(); err != nil {
+    log.Println("flow ended:", err)
 }
 ```
 
@@ -70,40 +53,37 @@ func main() {
 
 ## 📚 API Reference
 
-### **Types**
+### Types
 
 #### `type Flowm interface`
-The core flow manager interface.
 
 ```go
 type Flowm interface {
     AddAction(action Action)
+    WithContext(ctx context.Context) Flowm
+    WithHooks(h Hooks) Flowm
+    Do(function interface{}, params ...interface{}) Flowm
+    With(policy Policy) Flowm
+    PipeAll() Flowm
+    Pipe(indices ...int) Flowm
+    Map(mapper func([]any) []any) Flowm
+    ContinueOnError() Flowm
+    AddParallel(actions ...Action) Flowm
     Start() error
 }
 ```
 
----
-
-#### `type flowm struct`
-Internal implementation of `Flowm`.
-
----
-
 #### `type Action struct`
-Represents a function call with parameters and policies.
 
 ```go
 type Action struct {
-    Func     interface{}   // The function to call
-    Params   []interface{} // Parameters to pass
-    Policies []Policy      // Policies to apply after execution
+    Func     interface{}
+    Params   []interface{}
+    Policies []Policy
 }
 ```
 
----
-
 #### `type Policy interface`
-Any policy must implement the `Do` method.
 
 ```go
 type Policy interface {
@@ -111,102 +91,64 @@ type Policy interface {
 }
 ```
 
-Policies are executed after an action runs, receiving the action and any error it produced.
-
----
+Policies may also implement:
+- `PreExecutionPolicy{ Before(ctx, action) error }`
+- `ContextAwarePolicy{ SetContext(ctx) }`
+- `RetryHookAwarePolicy{ SetOnRetry(func(name string, attempt int, err error)) }`
 
 #### `type RetryPolicy struct`
-Retries a failed action with optional backoff and jitter.
 
 ```go
 type RetryPolicy struct {
-    Attempts      int
+    Attempts      int               // total attempts INCLUDING the initial call
     Delay         time.Duration
     MaxDelay      time.Duration
     BackoffFactor float64
     Jitter        bool
-    Fn            func() error // Optional pre-check before retry
+    Fn            func() error      // optional pre-check before each retry
+    RetryIf       func(error) bool  // retry predicate
+    MaxElapsed    time.Duration     // limit total retry time
 }
 ```
 
-##### RetryPolicy Behavior:
-- Retries the action if it fails, up to `Attempts` times.
-- Waits `Delay` between retries, optionally increasing with `BackoffFactor`.
-- Caps wait time at `MaxDelay` if set.
-- Adds randomness to delay if `Jitter` is `true`.
-- Stops retrying if error implements `DoNotRetry`.
+Behavior:
+- Swallows errors implementing `DoNotRetry`.
+- Respects `RetryIf`; if provided and returns false, stops retrying.
+- Emits OnRetry hook if configured via `WithHooks`.
 
----
+#### Piping
+- `PipeAll()` – pipe all return values to the next action.
+- `Pipe(indices...)` – pipe selected return indices.
+- `Map(func([]any) []any)` – transform outputs before passing on.
 
-#### `type DoNotRetry interface`
-Marker interface to indicate that an error should not be retried.
+#### Timeouts
+- `TimeoutPolicy{PerAttempt}` – bounds a single call duration; returns `context.DeadlineExceeded` on timeout.
 
+#### Continue-on-error
+- `ContinueOnErrorPolicy{Continue: true}` – continue the flow and swallow the error.
+- `TerminatePolicy` is deprecated; behaves like continue-on-error for backward-compat.
+
+#### Concurrency
+- `AddParallel(actions...)` – execute actions concurrently; results are flattened and can be piped.
+- `WorkerPoolPolicy{Size}` – optional semaphore to limit concurrency.
+
+#### Rate limiting and circuit breaker
+- `RateLimitPolicy{Per, Burst}`
+- `CircuitBreakerPolicy{Failures, Window, Cooldown}`
+
+#### Hooks
 ```go
-type DoNotRetry interface {
-    DoNotRetry()
+type Hooks struct {
+    OnStart   func(actionName string)
+    OnSuccess func(actionName string, result []any)
+    OnError   func(actionName string, err error)
+    OnRetry   func(actionName string, attempt int, err error)
 }
 ```
 
 ---
 
-### **Functions**
-
-#### `func New() Flowm`
-Creates a new `Flowm` instance.
-
----
-
-#### `func NewAction(function interface{}, params []interface{}, policy ...Policy) Action`
-Creates a new `Action` from a function, its parameters, and optional policies.
-
----
-
-#### `func (f *flowm) AddAction(act Action)`
-Adds an `Action` to the flow.
-
----
-
-#### `func (f *flowm) Start() error`
-Executes all actions in order.  
-Stops execution if an action returns an error not handled by its policies.
-
----
-
-## ⚡ Example with Retry and Backoff
-
-```go
-func mightFail(count *int) error {
-    *count++
-    fmt.Println("Attempt", *count)
-    if *count < 3 {
-        return errors.New("still failing")
-    }
-    fmt.Println("Success on attempt", *count)
-    return nil
-}
-
-func main() {
-    count := 0
-    f := flowm.New()
-
-    retry := &flowm.RetryPolicy{
-        Attempts:      5,
-        Delay:         500 * time.Millisecond,
-        BackoffFactor: 2.0,
-        MaxDelay:      3 * time.Second,
-        Jitter:        true,
-    }
-
-    f.AddAction(flowm.NewAction(mightFail, []interface{}{&count}, retry))
-    f.Start()
-}
-```
-
----
-
-## 🛠 Extending with Custom Policies
-
-You can define your own policies by implementing `Policy`.
+## 🛠 Custom Policies
 
 ```go
 type LogPolicy struct{}
@@ -217,14 +159,74 @@ func (l LogPolicy) Do(action flowm.Action, err error) error {
 }
 ```
 
-Usage:
-
-```go
-f.AddAction(flowm.NewAction(myFunc, []interface{}{}, LogPolicy{}))
-```
-
 ---
 
 ## 📜 License
 
-MIT License. See [LICENSE](LICENSE) for details.
+MIT License. See LICENSE.
+
+## Rate limiting
+
+`RateLimitPolicy` uses a simple token-bucket:
+- **Per**: time to generate one token (e.g., `time.Second/5` ≈ 5 req/s)
+- **Burst**: max tokens available at once (initially full)
+
+Attach it to actions to throttle calls. If you reuse the same policy instance across actions, they share the limiter (global rate); separate instances rate-limit independently.
+
+### Examples
+
+```go
+// 5 req/s, burst 2; shared across two actions (global limiter)
+rl := &flowm.RateLimitPolicy{Per: time.Second / 5, Burst: 2}
+
+f := flowm.New()
+
+f.AddAction(flowm.NewAction(callA, nil, rl))
+f.AddAction(flowm.NewAction(callB, nil, rl))
+_ = f.Start()
+```
+
+```go
+// Per-action limiters (independent)
+rlA := &flowm.RateLimitPolicy{Per: 200 * time.Millisecond, Burst: 1}
+rlB := &flowm.RateLimitPolicy{Per: 1 * time.Second, Burst: 1}
+
+f := flowm.New()
+f.AddAction(flowm.NewAction(callA, nil, rlA))
+f.AddAction(flowm.NewAction(callB, nil, rlB))
+_ = f.Start()
+```
+
+```go
+// Parallel with shared limiter + worker pool
+rl := &flowm.RateLimitPolicy{Per: time.Second / 10, Burst: 3}
+wp := &flowm.WorkerPoolPolicy{Size: 4}
+
+f := flowm.New()
+f.AddParallel(
+    flowm.NewAction(fetchUser, nil, rl, wp),
+    flowm.NewAction(fetchOrders, nil, rl, wp),
+    flowm.NewAction(fetchInventory, nil, rl, wp),
+).PipeAll()
+_ = f.Start()
+```
+
+### Context and timeouts
+- `RateLimitPolicy` waits for tokens but respects `ctx.Done()`. Provide `WithContext(ctx)` on the flow to enable cancellation.
+- If combined with `TimeoutPolicy{PerAttempt}`, the attempt can time out while waiting for a token, returning `context.DeadlineExceeded`.
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+defer cancel()
+rl := &flowm.RateLimitPolicy{Per: 200 * time.Millisecond, Burst: 1}
+
+f := flowm.New().WithContext(ctx)
+f.AddAction(flowm.NewAction(callSlowAPI, nil, rl, &flowm.TimeoutPolicy{PerAttempt: 100 * time.Millisecond}))
+err := f.Start() // likely deadline exceeded due to rate-limit wait
+```
+
+### Tips
+- For N QPS: set `Per = time.Second / N` and choose an appropriate `Burst`.
+- Ensure `Per > 0` and `Burst >= 1`.
+- Reuse the same `RateLimitPolicy` instance to enforce a shared/global limit across actions.
+- For strict fairness across many goroutines/flows, consider a centralized limiter you pass around (this policy is per-process, in-memory).
