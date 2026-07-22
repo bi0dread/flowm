@@ -32,7 +32,6 @@ err := f.Start()
   - [Parallel execution](#parallel-execution)
   - [ForEach fan-out](#foreach-fan-out)
   - [Subflows](#subflows)
-  - [Typed chains](#typed-chains)
   - [Observability hooks](#observability-hooks)
   - [Context propagation](#context-propagation)
   - [Custom policies](#custom-policies)
@@ -45,7 +44,6 @@ err := f.Start()
 
 - **One execution path, many policies.** Every attempt — first call, retry, or parallel branch — runs through the same pipeline: pre-execution checks, context injection, timeouts, and panic recovery. Policies compose correctly because they all see the same path.
 - **Catch-style fallbacks and saga rollback.** Chain `OnError` handlers like nested `catch` blocks, and register `Compensate` functions that undo completed steps when a later one fails.
-- **Typed chains when you want them.** An optional generics layer (`Step`/`Then`/`RunTyped`) gives compile-time type checking for linear pipelines.
 - **Zero dependencies.** Single package, standard library only.
 
 ## Installation
@@ -137,8 +135,6 @@ f := flowm.New()
 f.Do(compute)
 results, err := f.StartWithResult() // []interface{} of compute's outputs
 ```
-
-For typed results, see [typed chains](#typed-chains).
 
 ### Error handling and fallbacks
 
@@ -309,23 +305,6 @@ f.Do(save)
 
 This lets you build a library of reusable, pre-policied flows. A subflow instance holds state (context), so don't share one across concurrently running parents.
 
-### Typed chains
-
-An optional generics layer gives compile-time type checking for linear pipelines — mismatched step types fail at build time, not runtime:
-
-```go
-length := flowm.Step(func(s string) (int, error) { return len(s), nil })
-double := flowm.Step(func(n int) (int, error) { return n * 2, nil }).
-	With(&flowm.RetryPolicy{Attempts: 3, Delay: time.Millisecond})
-
-chain := flowm.Then(length, double)       // Then(Step[string,int], Step[int,int]) → Step[string,int]
-out, err := flowm.RunTyped(ctx, chain, "hello") // out is a typed int: 10
-```
-
-- `Step(fn)` wraps `func(I) (O, error)`; `StepCtx(fn)` wraps `func(context.Context, I) (O, error)` with automatic context injection.
-- `.With(policies...)` attaches policies to the step it's called on; each step in a `Then` chain keeps its own.
-- `RunTyped` executes the chain on a fresh flow and returns the final step's typed result.
-
 ### Observability hooks
 
 ```go
@@ -420,12 +399,6 @@ func Do(function interface{}, params ...interface{}) Action // chainable: .With,
 
 // Errors
 func Permanent(err error) error // mark non-retryable; unwrappable via errors.Is/As
-
-// Typed chains
-func Step[I, O any](fn func(I) (O, error)) TypedStep[I, O]
-func StepCtx[I, O any](fn func(context.Context, I) (O, error)) TypedStep[I, O]
-func Then[I, M, O any](first TypedStep[I, M], next TypedStep[M, O]) TypedStep[I, O]
-func RunTyped[I, O any](ctx context.Context, s TypedStep[I, O], input I) (O, error)
 ```
 
 Built-in policies:

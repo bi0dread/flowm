@@ -777,40 +777,6 @@ func TestFlowm_ForEach_EmptyPipeIsNoop(t *testing.T) {
 	}
 }
 
-func TestFlowm_TypedChain(t *testing.T) {
-	length := Step(func(s string) (int, error) { return len(s), nil })
-	double := Step(func(n int) (int, error) { return n * 2, nil })
-	chain := Then(length, double)
-	out, err := RunTyped(context.Background(), chain, "hello")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if out != 10 {
-		t.Fatalf("expected 10, got %d", out)
-	}
-}
-
-func TestFlowm_TypedChain_PolicyAndContext(t *testing.T) {
-	calls := 0
-	flaky := StepCtx(func(ctx context.Context, s string) (string, error) {
-		calls++
-		if calls < 2 {
-			return "", errors.New("not yet")
-		}
-		return s + "!", nil
-	}).With(&RetryPolicy{Attempts: 3, Delay: time.Millisecond})
-	out, err := RunTyped(context.Background(), flaky, "ok")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if out != "ok!" {
-		t.Fatalf("expected retried typed step result, got %q", out)
-	}
-	if calls != 2 {
-		t.Fatalf("expected 2 attempts, got %d", calls)
-	}
-}
-
 func TestFlowm_ContinueOnError_Continues(t *testing.T) {
 	f := New()
 	var ran bool
