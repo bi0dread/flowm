@@ -567,6 +567,250 @@ func TestFlowm_DoStyleAction_WithDoesNotShareBackingArray(t *testing.T) {
 	}
 }
 
+func TestFlowm_StartWithResult(t *testing.T) {
+	f := New()
+	f.Do(func() (int, string, error) { return 7, "x", nil })
+	res, err := f.StartWithResult()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 2 || res[0] != 7 || res[1] != "x" {
+		t.Fatalf("unexpected result: %v", res)
+	}
+}
+
+func TestFlowm_PermanentError_NotRetried(t *testing.T) {
+	calls := 0
+	base := errors.New("bad request")
+	fn := func() error { calls++; return fmt.Errorf("wrap: %w", Permanent(base)) }
+	retry := &RetryPolicy{Attempts: 5, Delay: time.Millisecond}
+	f := New()
+	f.Do(fn).With(retry)
+	if err := f.Start(); err != nil {
+		t.Fatalf("DoNotRetry errors are swallowed, got %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected no retries for a Permanent error, got %d calls", calls)
+	}
+}
+
+func TestFlowm_PermanentError_MidRetryStops(t *testing.T) {
+	calls := 0
+	fn := func() error {
+		calls++
+		if calls == 1 {
+			return errors.New("transient")
+		}
+		return Permanent(errors.New("gone permanent"))
+	}
+	retry := &RetryPolicy{Attempts: 5, Delay: time.Millisecond}
+	f := New()
+	f.Do(fn).With(retry)
+	if err := f.Start(); err != nil {
+		t.Fatalf("expected permanent error to be swallowed, got %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("expected retrying to stop at the permanent error, got %d calls", calls)
+	}
+}
+
+func TestFlowm_MultiError_ErrorsIs(t *testing.T) {
+	sentinel := errors.New("sentinel")
+	f := New()
+	f.AddParallel(
+		Do(func() error { return sentinel }),
+		Do(func() error { return errors.New("other") }),
+	)
+	err := f.Start()
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected errors.Is to find the sentinel inside MultiError, got %v", err)
+	}
+}
+
+func TestFlowm_TimeoutPolicy_OverallBudget(t *testing.T) {
+	f := New().WithContext(context.Background())
+	var calls atomic.Int32
+	slow := func() error {
+		calls.Add(1)
+		time.Sleep(30 * time.Millisecond)
+		return errors.New("fail")
+	}
+	retry := &RetryPolicy{Attempts: 10, Delay: time.Millisecond}
+	f.AddAction(NewAction(slow, nil, &TimeoutPolicy{Overall: 50 * time.Millisecond}, retry))
+	err := f.Start()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded from overall budget, got %v", err)
+	}
+	if c := calls.Load(); c < 1 || c > 4 {
+		t.Fatalf("expected only a few attempts within the 50ms budget, got %d", c)
+	}
+}
+
+func TestFlowm_CircuitBreaker_CountsRetryAttempts(t *testing.T) {
+	cb := &CircuitBreakerPolicy{Failures: 3, Window: time.Second, Cooldown: time.Second}
+	calls := 0
+	bad := func() error { calls++; return errors.New("fail") }
+	retry := &RetryPolicy{Attempts: 5, Delay: time.Millisecond}
+	f := New()
+	f.Do(bad).With(cb).With(retry)
+	if err := f.Start(); err == nil {
+		t.Fatal("expected error")
+	}
+	if calls != 3 {
+		t.Fatalf("expected breaker to open after 3 attempts (retries counted), got %d calls", calls)
+	}
+}
+
+func TestFlowm_When_ConditionalExecution(t *testing.T) {
+	f := New()
+	var skippedRan, ran, passedThrough bool
+	f.Do(func() int { return 5 }).PipeAll()
+	f.Do(func(n int) { skippedRan = true }).When(func(piped []interface{}) bool { return false })
+	f.Do(func(n int) { ran = n == 5 }).When(func(piped []interface{}) bool {
+		return len(piped) == 1 && piped[0].(int) > 3
+	})
+	f.Do(func() { passedThrough = true })
+	if err := f.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if skippedRan {
+		t.Fatal("expected false condition to skip the action")
+	}
+	if !ran {
+		t.Fatal("expected piped values to pass through the skipped action to the next one")
+	}
+	if !passedThrough {
+		t.Fatal("expected flow to continue after conditional actions")
+	}
+}
+
+func TestFlowm_Compensation_RunsInReverseOnFailure(t *testing.T) {
+	var undone []string
+	f := New()
+	f.Do(func() error { return nil }).Compensate(func() { undone = append(undone, "first") })
+	f.Do(func() error { return nil }).Compensate(func() { undone = append(undone, "second") })
+	f.Do(func() error { return errors.New("boom") })
+	err := f.Start()
+	if err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("expected original error to propagate, got %v", err)
+	}
+	if len(undone) != 2 || undone[0] != "second" || undone[1] != "first" {
+		t.Fatalf("expected reverse-order compensation, got %v", undone)
+	}
+}
+
+func TestFlowm_Compensation_NotRunOnSuccess(t *testing.T) {
+	var undone bool
+	f := New()
+	f.Do(func() error { return nil }).Compensate(func() { undone = true })
+	f.Do(func() error { return nil })
+	if err := f.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if undone {
+		t.Fatal("compensation must not run when the flow succeeds")
+	}
+}
+
+func TestFlowm_Compensation_FailedActionNotCompensated(t *testing.T) {
+	var undone []string
+	f := New()
+	f.Do(func() error { return nil }).Compensate(func() { undone = append(undone, "ok-step") })
+	f.Do(func() error { return errors.New("boom") }).Compensate(func() { undone = append(undone, "failed-step") })
+	if err := f.Start(); err == nil {
+		t.Fatal("expected error")
+	}
+	if len(undone) != 1 || undone[0] != "ok-step" {
+		t.Fatalf("only succeeded actions may compensate, got %v", undone)
+	}
+}
+
+func TestFlowm_DoFlow_Subflow(t *testing.T) {
+	sub := New()
+	sub.Do(func() (int, error) { return 21, nil }).PipeAll()
+	sub.Do(func(n int) int { return n * 2 })
+
+	var got int
+	f := New()
+	f.DoFlow(sub).PipeAll()
+	f.Do(func(n int) { got = n })
+	if err := f.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if got != 42 {
+		t.Fatalf("expected subflow result 42, got %d", got)
+	}
+}
+
+func TestFlowm_DoFlow_SubflowErrorPropagates(t *testing.T) {
+	sub := New()
+	sub.Do(func() error { return errors.New("sub failed") })
+	f := New()
+	f.DoFlow(sub)
+	err := f.Start()
+	if err == nil || err.Error() != "sub failed" {
+		t.Fatalf("expected subflow error to propagate, got %v", err)
+	}
+}
+
+func TestFlowm_ForEach_MapsOverPipedSlice(t *testing.T) {
+	f := New()
+	f.Do(func() []int { return []int{1, 2, 3} }).PipeAll()
+	f.ForEach(func(n int) int { return n * 10 }).PipeAll()
+	var got []int
+	f.Do(func(a, b, c int) { got = []int{a, b, c} })
+	if err := f.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 || got[0] != 10 || got[1] != 20 || got[2] != 30 {
+		t.Fatalf("unexpected foreach results: %v", got)
+	}
+}
+
+func TestFlowm_ForEach_EmptyPipeIsNoop(t *testing.T) {
+	f := New()
+	f.Do(func() []int { return nil }).PipeAll()
+	f.ForEach(func(n int) int { return n * 10 })
+	f.Do(func() {})
+	if err := f.Start(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFlowm_TypedChain(t *testing.T) {
+	length := Step(func(s string) (int, error) { return len(s), nil })
+	double := Step(func(n int) (int, error) { return n * 2, nil })
+	chain := Then(length, double)
+	out, err := RunTyped(context.Background(), chain, "hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != 10 {
+		t.Fatalf("expected 10, got %d", out)
+	}
+}
+
+func TestFlowm_TypedChain_PolicyAndContext(t *testing.T) {
+	calls := 0
+	flaky := StepCtx(func(ctx context.Context, s string) (string, error) {
+		calls++
+		if calls < 2 {
+			return "", errors.New("not yet")
+		}
+		return s + "!", nil
+	}).With(&RetryPolicy{Attempts: 3, Delay: time.Millisecond})
+	out, err := RunTyped(context.Background(), flaky, "ok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "ok!" {
+		t.Fatalf("expected retried typed step result, got %q", out)
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 attempts, got %d", calls)
+	}
+}
+
 func TestFlowm_ContinueOnError_Continues(t *testing.T) {
 	f := New()
 	var ran bool
