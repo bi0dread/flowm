@@ -33,6 +33,7 @@ type Flowm interface {
 	Pipe(indices ...int) Flowm
 	Map(mapper func([]interface{}) []interface{}) Flowm
 	ContinueOnError() Flowm
+	OnError(function interface{}, params ...interface{}) Flowm
 	AddParallel(actions ...Action) Flowm
 	Start() error
 }
@@ -97,6 +98,27 @@ func NewAction(function interface{}, Params []interface{}, Policy ...Policy) Act
 	}
 }
 
+// Do builds an Action with the same signature as Flowm.Do; attach policies by
+// chaining, e.g. flowm.Do(fn, arg).With(retry).OnError(fallback). Intended for
+// AddParallel and anywhere an Action value is needed.
+func Do(function interface{}, params ...interface{}) Action {
+	return Action{Func: function, Params: params}
+}
+
+// With returns a copy of the action with the policies attached.
+func (a Action) With(policies ...Policy) Action {
+	combined := make([]Policy, 0, len(a.Policies)+len(policies))
+	combined = append(combined, a.Policies...)
+	combined = append(combined, policies...)
+	a.Policies = combined
+	return a
+}
+
+// OnError attaches a fallback function to the action, like Flowm.OnError.
+func (a Action) OnError(function interface{}, params ...interface{}) Action {
+	return a.With(&FallbackPolicy{Func: function, Params: params})
+}
+
 func (f *flowm) call(funcName int, params ...interface{}) (result []interface{}, err error) {
 	return f.callFunc(f.stubStorage[funcName].Action.Func, params...)
 }
@@ -153,40 +175,56 @@ func (f *flowm) runSingleAction(st stub) (result []interface{}, err error, pipeN
 				rh.SetOnRetry(f.hooks.OnRetry)
 			}
 		}
+		if fa, ok := p.(FallbackAwarePolicy); ok {
+			fa.SetFlowCaller(f.callFunc)
+			fa.SetResultSink(func(res []interface{}) { result = res })
+		}
 	}
-	// pre-execution checks
+	var timeout time.Duration
 	for _, p := range st.Action.Policies {
-		if pre, ok := p.(PreExecutionPolicy); ok {
-			if perr := pre.Before(f.ctx, st.Action); perr != nil {
-				err = perr
-				break
+		if t, ok := p.(*TimeoutPolicy); ok && t.PerAttempt > 0 {
+			timeout = t.PerAttempt
+			break
+		}
+	}
+	// executeOnce runs one full attempt: pre-execution checks (rate limit,
+	// circuit breaker), context injection, per-attempt timeout, and panic
+	// recovery. Both the initial call and every retry go through it.
+	executeOnce := func() (res []interface{}, execErr error) {
+		defer func() {
+			if r := recover(); r != nil {
+				res = nil
+				execErr = fmt.Errorf("panic: %v", r)
 			}
+		}()
+		for _, p := range st.Action.Policies {
+			if pre, ok := p.(PreExecutionPolicy); ok {
+				if perr := pre.Before(f.ctx, st.Action); perr != nil {
+					return nil, perr
+				}
+			}
+		}
+		if timeout > 0 {
+			return f.callWithTimeout(st.Action, timeout)
+		}
+		return f.callFunc(st.Action.Func, st.Action.Params...)
+	}
+	for _, p := range st.Action.Policies {
+		if ea, ok := p.(ExecutorAwarePolicy); ok {
+			ea.SetExecutor(func() ([]interface{}, error) {
+				res, execErr := executeOnce()
+				if execErr == nil {
+					// a successful retry replaces the piped result
+					result = res
+				}
+				return res, execErr
+			})
 		}
 	}
 	if f.hooks != nil && f.hooks.OnStart != nil {
 		f.hooks.OnStart(st.Name)
 	}
-	if err == nil {
-		var timeout time.Duration
-		var hasTimeout bool
-		for _, p := range st.Action.Policies {
-			if t, ok := p.(*TimeoutPolicy); ok && t.PerAttempt > 0 {
-				timeout = t.PerAttempt
-				hasTimeout = true
-				break
-			}
-		}
-		if hasTimeout {
-			result, err = f.callWithTimeout(st.Action, timeout)
-		} else {
-			defer func() {
-				if r := recover(); r != nil {
-					err = fmt.Errorf("panic: %v", r)
-				}
-			}()
-			result, err = f.callFunc(st.Action.Func, st.Action.Params...)
-		}
-	}
+	result, err = executeOnce()
 	for _, policy := range st.Action.Policies {
 		if c, ok := policy.(*ContinueOnErrorPolicy); ok && c.Continue {
 			continueOnErr = true
@@ -362,6 +400,21 @@ type RetryHookAwarePolicy interface {
 	SetOnRetry(fn func(actionName string, attempt int, err error))
 }
 
+// ExecutorAwarePolicy lets a policy re-run the action through the flow's
+// normal execution path (pre-execution checks, context injection, per-attempt
+// timeout, panic recovery) instead of invoking the raw function directly.
+type ExecutorAwarePolicy interface {
+	SetExecutor(fn func() ([]interface{}, error))
+}
+
+// FallbackAwarePolicy lets a policy invoke alternative functions through the
+// flow's calling machinery (context injection) and replace the action's piped
+// result when it recovers from an error.
+type FallbackAwarePolicy interface {
+	SetFlowCaller(call func(fn interface{}, params ...interface{}) ([]interface{}, error))
+	SetResultSink(sink func([]interface{}))
+}
+
 type RetryPolicy struct {
 	Attempts      int
 	Delay         time.Duration
@@ -373,6 +426,7 @@ type RetryPolicy struct {
 	MaxElapsed    time.Duration
 	ctx           context.Context
 	onRetry       func(actionName string, attempt int, err error)
+	execute       func() ([]interface{}, error)
 }
 
 type PassValuesPolicy struct {
@@ -394,6 +448,71 @@ func (r *TerminatePolicy) Do(action Action, mainErr error) error {
 type ContinueOnErrorPolicy struct{ Continue bool }
 
 func (c *ContinueOnErrorPolicy) Do(action Action, mainErr error) error { return mainErr }
+
+// FallbackPolicy runs an alternative function when the action fails. If the
+// fallback succeeds, the error is swallowed and the fallback's return values
+// replace the action's outputs for piping. The action's error is passed to
+// the fallback if it declares a leading error parameter (after an optional
+// context.Context). Chain multiple fallbacks: the next one runs only if the
+// previous fallback also failed.
+type FallbackPolicy struct {
+	Func   interface{}
+	Params []interface{}
+	caller func(fn interface{}, params ...interface{}) ([]interface{}, error)
+	sink   func([]interface{})
+}
+
+func (p *FallbackPolicy) SetFlowCaller(call func(fn interface{}, params ...interface{}) ([]interface{}, error)) {
+	p.caller = call
+}
+
+func (p *FallbackPolicy) SetResultSink(sink func([]interface{})) { p.sink = sink }
+
+func (p *FallbackPolicy) Do(action Action, mainErr error) (err error) {
+	if mainErr == nil || p.Func == nil {
+		return mainErr
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+	params := p.Params
+	if fnType := reflect.TypeOf(p.Func); fnType != nil && fnType.Kind() == reflect.Func {
+		params = injectFallbackError(fnType, params, mainErr)
+	}
+	call := p.caller
+	if call == nil {
+		// standalone use outside a flow: no caller injected
+		call = func(fn interface{}, ps ...interface{}) ([]interface{}, error) { return callReflect(fn, ps...) }
+	}
+	res, ferr := call(p.Func, params...)
+	if ferr != nil {
+		return ferr
+	}
+	if p.sink != nil {
+		p.sink(res)
+	}
+	return nil
+}
+
+// injectFallbackError prepends the action's error to the fallback params when
+// the function declares an error parameter first (after an optional context).
+func injectFallbackError(fnType reflect.Type, params []interface{}, mainErr error) []interface{} {
+	errType := reflect.TypeOf((*error)(nil)).Elem()
+	ctxType := reflect.TypeOf((*context.Context)(nil)).Elem()
+	pos := 0
+	if fnType.NumIn() > 0 && fnType.In(0) == ctxType {
+		pos = 1
+	}
+	if fnType.NumIn() > pos && fnType.In(pos) == errType && len(params) == fnType.NumIn()-pos-1 {
+		injected := make([]interface{}, 0, len(params)+1)
+		injected = append(injected, mainErr)
+		injected = append(injected, params...)
+		return injected
+	}
+	return params
+}
 
 type PipeAllPolicy struct{}
 
@@ -508,6 +627,7 @@ func (w *WorkerPoolPolicy) Do(action Action, mainErr error) error { return mainE
 
 func (r *RetryPolicy) SetContext(ctx context.Context)                                { r.ctx = ctx }
 func (r *RetryPolicy) SetOnRetry(fn func(actionName string, attempt int, err error)) { r.onRetry = fn }
+func (r *RetryPolicy) SetExecutor(fn func() ([]interface{}, error))                  { r.execute = fn }
 
 func (r *RetryPolicy) Do(action Action, mainErr error) error {
 	if mainErr == nil {
@@ -533,7 +653,8 @@ func (r *RetryPolicy) Do(action Action, mainErr error) error {
 		}
 		if r.Fn != nil {
 			if err := r.Fn(); err != nil {
-				return nil
+				// pre-check failed: stop retrying, keep the underlying error
+				return lastErr
 			}
 		}
 		if r.BackoffFactor > 1 {
@@ -545,7 +666,13 @@ func (r *RetryPolicy) Do(action Action, mainErr error) error {
 		if r.Jitter {
 			delay = time.Duration(float64(delay) * (0.5 + rand.Float64()/2))
 		}
-		_, callErr := callReflect(action.Func, action.Params...)
+		var callErr error
+		if r.execute != nil {
+			_, callErr = r.execute()
+		} else {
+			// standalone use outside a flow: no executor injected
+			_, callErr = callReflect(action.Func, action.Params...)
+		}
 		if callErr == nil {
 			if r.onRetry != nil {
 				r.onRetry(functionNameOf(action.Func), attempt, nil)
@@ -660,6 +787,13 @@ func (f *flowm) Map(mapper func([]interface{}) []interface{}) Flowm {
 }
 
 func (f *flowm) ContinueOnError() Flowm { return f.With(&ContinueOnErrorPolicy{Continue: true}) }
+
+// OnError attaches a fallback function to the last added action: it runs when
+// the action fails, and if it succeeds the flow continues with its return
+// values as the piped outputs.
+func (f *flowm) OnError(function interface{}, params ...interface{}) Flowm {
+	return f.With(&FallbackPolicy{Func: function, Params: params})
+}
 
 func (f *flowm) AddParallel(actions ...Action) Flowm {
 	par := f.newParallelAction(actions, nil)
