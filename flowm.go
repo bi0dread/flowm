@@ -13,9 +13,11 @@ import (
 )
 
 type Action struct {
+	Name     string
 	Func     interface{}
 	Params   []interface{}
 	Policies []Policy
+	parallel *parallelGroup
 }
 
 type stub struct {
@@ -28,14 +30,17 @@ type Flowm interface {
 	WithContext(ctx context.Context) Flowm
 	WithHooks(h Hooks) Flowm
 	Do(function interface{}, params ...interface{}) Flowm
+	Named(name string) Flowm
 	With(policy Policy) Flowm
 	PipeAll() Flowm
 	Pipe(indices ...int) Flowm
 	Map(mapper func([]interface{}) []interface{}) Flowm
 	ContinueOnError() Flowm
 	OnError(function interface{}, params ...interface{}) Flowm
-	When(pred func(piped []interface{}) bool) Flowm
+	When(predicate interface{}) Flowm
 	AddParallel(actions ...Action) Flowm
+	WithConcurrency(limit int) Flowm
+	Validate() error
 	Start() error
 	StartWithResult() ([]interface{}, error)
 }
@@ -57,7 +62,7 @@ func New() Flowm {
 }
 
 func (f *flowm) AddAction(act Action) {
-	f.stubStorage = append(f.stubStorage, stub{Name: functionNameOf(act.Func), Action: act})
+	f.stubStorage = append(f.stubStorage, stub{Name: actionName(act), Action: act})
 	f.lastIndex = len(f.stubStorage) - 1
 }
 
@@ -69,19 +74,43 @@ func (f *flowm) Start() error {
 // StartWithResult runs the flow and returns the last executed action's
 // non-error return values alongside the flow error.
 func (f *flowm) StartWithResult() ([]interface{}, error) {
+	if err := f.Validate(); err != nil {
+		return nil, err
+	}
 	var pipedValues []interface{}
 	hasPiped := false
 	var lastResult []interface{}
 	for i := range f.stubStorage {
 		st := f.stubStorage[i]
-		if condition := conditionPolicyOf(st.Action); condition != nil && condition.If != nil && !condition.If(pipedValues) {
-			// A skipped action leaves the incoming values for the next action.
-			continue
+		if err := f.ctx.Err(); err != nil {
+			failure := &ActionError{Name: st.Name, Err: err}
+			if f.hooks != nil && f.hooks.OnError != nil {
+				f.hooks.OnError(st.Name, failure)
+			}
+			return nil, failure
+		}
+		if condition := conditionPolicyOf(st.Action); condition != nil {
+			run, err := f.evaluateCondition(condition.If, pipedValues)
+			if err != nil {
+				failure := &ActionError{Name: st.Name, Err: err}
+				if f.hooks != nil && f.hooks.OnError != nil {
+					f.hooks.OnError(st.Name, failure)
+				}
+				return nil, failure
+			}
+			if !run {
+				if f.hooks != nil && f.hooks.OnSkip != nil {
+					f.hooks.OnSkip(st.Name)
+				}
+				continue
+			}
 		}
 		if hasPiped {
-			params := make([]interface{}, 0, len(st.Action.Params)+len(pipedValues))
-			params = append(params, st.Action.Params...)
-			st.Action.Params = append(params, pipedValues...)
+			if st.Action.parallel == nil {
+				params := make([]interface{}, 0, len(st.Action.Params)+len(pipedValues))
+				params = append(params, st.Action.Params...)
+				st.Action.Params = append(params, pipedValues...)
+			}
 			hasPiped = false
 			pipedValues = nil
 		}
@@ -130,6 +159,13 @@ func Do(function interface{}, params ...interface{}) Action {
 	return Action{Func: function, Params: params}
 }
 
+// Named returns an action with a name used by errors and hooks.
+// An empty name uses the function's name.
+func (a Action) Named(name string) Action {
+	a.Name = name
+	return a
+}
+
 // With returns a copy of the action with the policies attached.
 func (a Action) With(policies ...Policy) Action {
 	combined := make([]Policy, 0, len(a.Policies)+len(policies))
@@ -144,48 +180,72 @@ func (a Action) OnError(function interface{}, params ...interface{}) Action {
 	return a.With(&FallbackPolicy{Func: function, Params: params})
 }
 
-func (f *flowm) callFunc(funcValue interface{}, params ...interface{}) (result []interface{}, err error) {
-	function := reflect.ValueOf(funcValue)
-	// inject context if first param is context.Context and provided args are one fewer
-	expected := function.Type().NumIn()
-	if expected > 0 && function.Type().In(0) == reflect.TypeOf((*context.Context)(nil)).Elem() {
-		if len(params) == expected-1 {
-			injected := []interface{}{f.ctx}
-			injected = append(injected, params...)
-			return callReflect(funcValue, injected...)
-		}
+func (f *flowm) callFunc(function interface{}, params ...interface{}) ([]interface{}, error) {
+	args, err := prepareArguments(function, params, f.ctx, false)
+	if err != nil {
+		return nil, err
 	}
-	return callReflect(funcValue, params...)
+	return callValues(function, args)
 }
 
-func callReflect(funcValue interface{}, params ...interface{}) (result []interface{}, err error) {
-	function := reflect.ValueOf(funcValue)
-	if len(params) != function.Type().NumIn() {
-		err = errors.New("The number of params is out of index")
-		return
+func callReflect(function interface{}, params ...interface{}) ([]interface{}, error) {
+	args, err := prepareArguments(function, params, nil, false)
+	if err != nil {
+		return nil, err
 	}
-	in := make([]reflect.Value, len(params))
-	for k, param := range params {
-		in[k] = reflect.ValueOf(param)
-	}
-	var res []reflect.Value
-	res = function.Call(in)
-	var mainErr error
-	for _, v := range res {
-		if v.Type().ConvertibleTo(reflect.TypeOf((*error)(nil)).Elem()) {
-			if v.IsNil() {
-				continue
+	return callValues(function, args)
+}
+
+func callValues(function interface{}, args []reflect.Value) ([]interface{}, error) {
+	var result []interface{}
+	var errs []error
+	for _, value := range reflect.ValueOf(function).Call(args) {
+		if value.Type().Implements(errorType) {
+			if !nilValue(value) {
+				errs = append(errs, value.Interface().(error))
 			}
-			if err = v.Interface().(error); err != nil {
-				mainErr = err
-			}
+			continue
 		}
-		result = append(result, v.Interface())
+		result = append(result, value.Interface())
 	}
-	return result, mainErr
+	if len(errs) == 1 {
+		return result, errs[0]
+	}
+	return result, errors.Join(errs...)
 }
 
 func (f *flowm) runSingleAction(st stub) (result []interface{}, err error, pipeNext bool, pipeVals []interface{}, continueOnErr bool) {
+	attempts := 0
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			result, pipeNext, pipeVals = nil, false, nil
+			err = fmt.Errorf("panic: %v", recovered)
+		}
+		if err != nil {
+			err = &ActionError{Name: st.Name, Attempts: attempts, Err: err}
+			if f.hooks != nil && f.hooks.OnError != nil {
+				f.hooks.OnError(st.Name, err)
+			}
+		} else if f.hooks != nil && f.hooks.OnSuccess != nil {
+			f.hooks.OnSuccess(st.Name, result)
+		}
+	}()
+	if st.Action.parallel != nil {
+		limit, limitErr := parallelLimit(st.Action)
+		if limitErr != nil {
+			err = limitErr
+			return
+		}
+		members := st.Action.parallel.actions
+		st.Action.Func = func(ctx context.Context) ([]interface{}, error) {
+			return f.runParallel(ctx, members, limit)
+		}
+		st.Action.Params = nil
+	}
+	if _, argErr := prepareArguments(st.Action.Func, st.Action.Params, f.ctx, false); argErr != nil {
+		err = argErr
+		return
+	}
 	// Execution callbacks belong to this invocation, not shared configuration.
 	st.Action.Policies = append([]Policy(nil), st.Action.Policies...)
 	for i, p := range st.Action.Policies {
@@ -218,8 +278,10 @@ func (f *flowm) runSingleAction(st stub) (result []interface{}, err error, pipeN
 		}
 		if rh, ok := p.(RetryHookAwarePolicy); ok {
 			var onRetry func(string, int, error)
-			if f.hooks != nil {
-				onRetry = f.hooks.OnRetry
+			if f.hooks != nil && f.hooks.OnRetry != nil {
+				onRetry = func(_ string, attempt int, err error) {
+					f.hooks.OnRetry(st.Name, attempt, err)
+				}
 			}
 			rh.SetOnRetry(onRetry)
 		}
@@ -268,6 +330,7 @@ func (f *flowm) runSingleAction(st stub) (result []interface{}, err error, pipeN
 			return nil, err
 		}
 		executed = true
+		attempts++
 		attemptFlow := *f
 		attemptFlow.ctx = attemptCtx
 		if attemptCtx.Done() != nil {
@@ -331,15 +394,6 @@ func (f *flowm) runSingleAction(st stub) (result []interface{}, err error, pipeN
 			}
 		}
 	}
-	if err != nil {
-		if f.hooks != nil && f.hooks.OnError != nil {
-			f.hooks.OnError(st.Name, err)
-		}
-	} else {
-		if f.hooks != nil && f.hooks.OnSuccess != nil {
-			f.hooks.OnSuccess(st.Name, result)
-		}
-	}
 	return
 }
 
@@ -364,64 +418,6 @@ func (f *flowm) callWithContext(a Action) ([]interface{}, error) {
 	case out := <-ch:
 		return out.res, out.err
 	}
-}
-
-func (f *flowm) newParallelAction(actions []Action) Action {
-	runner := func(ctx context.Context) ([]interface{}, error) {
-		group := *f
-		group.ctx = ctx
-		type r struct {
-			res []interface{}
-			err error
-		}
-		wg := sync.WaitGroup{}
-		out := make([]r, len(actions))
-		var sem chan struct{}
-		semSize := 0
-		for _, a := range actions {
-			for _, p := range a.Policies {
-				if wp, ok := p.(*WorkerPoolPolicy); ok && wp.Size > 0 {
-					semSize = wp.Size
-					break
-				}
-			}
-		}
-		if semSize > 0 {
-			sem = make(chan struct{}, semSize)
-		}
-		for i := range actions {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				if sem != nil {
-					select {
-					case sem <- struct{}{}:
-					case <-ctx.Done():
-						out[i].err = ctx.Err()
-						return
-					}
-					defer func() { <-sem }()
-				}
-				st := stub{Name: functionNameOf(actions[i].Func), Action: actions[i]}
-				rres, rerr, _, _, continueOnErr := group.runSingleAction(st)
-				if continueOnErr {
-					rerr = nil
-				}
-				out[i] = r{res: rres, err: rerr}
-			}()
-		}
-		wg.Wait()
-		var errs []error
-		var results []interface{}
-		for i := range out {
-			if out[i].err != nil {
-				errs = append(errs, out[i].err)
-			}
-			results = append(results, filterErrorValues(out[i].res)...)
-		}
-		return results, errors.Join(errs...)
-	}
-	return Do(runner)
 }
 
 type Policy interface {
@@ -479,10 +475,12 @@ type ContinueOnErrorPolicy struct{ Continue bool }
 func (c *ContinueOnErrorPolicy) Do(action Action, mainErr error) error { return mainErr }
 
 // ConditionPolicy gates a top-level flow action using its incoming piped values.
+// If accepts a typed predicate such as func(Order) bool, or the legacy
+// func([]interface{}) bool form. Predicates must return exactly one boolean.
 // A false predicate skips the action without consuming those values.
 // A nil predicate allows the action to run. Sugar: Flowm.When.
 type ConditionPolicy struct {
-	If func(piped []interface{}) bool
+	If interface{}
 }
 
 func (c *ConditionPolicy) Do(action Action, mainErr error) error { return mainErr }
@@ -534,19 +532,27 @@ func (p *FallbackPolicy) Do(action Action, mainErr error) (err error) {
 	return nil
 }
 
-// injectFallbackError prepends the action's error to the fallback params when
-// the function declares an error parameter first (after an optional context).
+// injectFallbackError inserts the failure after an optional explicit context.
 func injectFallbackError(fnType reflect.Type, params []interface{}, mainErr error) []interface{} {
-	errType := reflect.TypeOf((*error)(nil)).Elem()
-	ctxType := reflect.TypeOf((*context.Context)(nil)).Elem()
-	pos := 0
-	if fnType.NumIn() > 0 && fnType.In(0) == ctxType {
-		pos = 1
+	position, argument := 0, 0
+	if fnType.NumIn() > 0 && fnType.In(0) == contextType {
+		position = 1
+		if explicitContext(params) && (fnType.IsVariadic() || len(params) >= fnType.NumIn()-1) {
+			argument = 1
+		}
 	}
-	if fnType.NumIn() > pos && fnType.In(pos) == errType && len(params) == fnType.NumIn()-pos-1 {
+	if fnType.NumIn() <= position || fnType.In(position) != errorType {
+		return params
+	}
+	inject := len(params) == fnType.NumIn()-position+argument-1
+	if fnType.IsVariadic() {
+		inject = len(params) <= argument || params[argument] == nil || !reflect.TypeOf(params[argument]).AssignableTo(errorType)
+	}
+	if inject {
 		injected := make([]interface{}, 0, len(params)+1)
+		injected = append(injected, params[:argument]...)
 		injected = append(injected, mainErr)
-		injected = append(injected, params...)
+		injected = append(injected, params[argument:]...)
 		return injected
 	}
 	return params
@@ -662,6 +668,8 @@ func (r *RateLimitPolicy) Before(ctx context.Context, action Action) error {
 
 func (r *RateLimitPolicy) Do(action Action, mainErr error) error { return mainErr }
 
+// WorkerPoolPolicy sets a parallel group limit. Prefer Flowm.WithConcurrency.
+// Placement on a member is deprecated; a group limit takes precedence.
 type WorkerPoolPolicy struct{ Size int }
 
 func (w *WorkerPoolPolicy) Do(action Action, mainErr error) error { return mainErr }
@@ -767,6 +775,7 @@ func functionNameOf(fn interface{}) string {
 }
 
 type Hooks struct {
+	OnSkip    func(actionName string)
 	OnStart   func(actionName string)
 	OnSuccess func(actionName string, result []interface{})
 	OnError   func(actionName string, err error)
@@ -816,15 +825,42 @@ func (f *flowm) OnError(function interface{}, params ...interface{}) Flowm {
 	return f.With(&FallbackPolicy{Func: function, Params: params})
 }
 
-// When runs the last added action only if pred accepts its incoming piped values.
-// The predicate receives nil when nothing was piped. Skipping the action leaves
-// the values available for the next action.
-func (f *flowm) When(pred func(piped []interface{}) bool) Flowm {
-	return f.With(&ConditionPolicy{If: pred})
+// When runs the last added action only if predicate accepts its piped values.
+// It accepts typed predicates such as func(Order) bool and the original
+// func([]interface{}) bool form. A zero-argument predicate can use captured
+// state. Skipping leaves values available for the next action and emits OnSkip.
+func (f *flowm) When(predicate interface{}) Flowm {
+	return f.With(&ConditionPolicy{If: predicate})
 }
 
 func (f *flowm) AddParallel(actions ...Action) Flowm {
-	par := f.newParallelAction(actions)
+	par := Action{Name: "parallel", parallel: &parallelGroup{actions: append([]Action(nil), actions...)}}
 	f.AddAction(par)
 	return f
+}
+
+// Named sets the last added action's name for errors and hooks.
+func (f *flowm) Named(name string) Flowm {
+	if f.lastIndex >= 0 {
+		st := &f.stubStorage[f.lastIndex]
+		st.Action.Name = name
+		st.Name = actionName(st.Action)
+	}
+	return f
+}
+
+// WithConcurrency limits the last added parallel group to limit active members.
+// The limit must be positive. Validate reports use on a non-parallel action.
+func (f *flowm) WithConcurrency(limit int) Flowm {
+	return f.With(&WorkerPoolPolicy{Size: limit})
+}
+
+func actionName(action Action) string {
+	if action.Name != "" {
+		return action.Name
+	}
+	if action.parallel != nil {
+		return "parallel"
+	}
+	return functionNameOf(action.Func)
 }

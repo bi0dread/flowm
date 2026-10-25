@@ -221,7 +221,8 @@ func TestFlowm_CircuitBreaker_Open(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from circuit breaker")
 	}
-	if err.Error() != "circuit breaker open" {
+	var failure *ActionError
+	if !errors.As(err, &failure) || failure.Attempts != 0 || failure.Err.Error() != "circuit breaker open" {
 		t.Fatalf("expected breaker open, got %v", err)
 	}
 }
@@ -299,7 +300,8 @@ func TestFlowm_RetryPolicy_RespectsOpenCircuitBreaker(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("expected retries to be blocked by open breaker, got %d calls", calls)
 	}
-	if err.Error() != "circuit breaker open" {
+	var failure *ActionError
+	if !errors.As(err, &failure) || failure.Attempts != 1 || failure.Err.Error() != "circuit breaker open" {
 		t.Fatalf("expected breaker-open error from retries, got %v", err)
 	}
 }
@@ -436,11 +438,12 @@ func TestFlowm_OnError_AfterRetryExhausted(t *testing.T) {
 }
 
 func TestFlowm_OnError_FallbackFailurePropagates(t *testing.T) {
+	failure := errors.New("fallback down")
 	f := New()
 	f.Do(func() error { return errors.New("primary down") }).
-		OnError(func(err error) error { return errors.New("fallback down") })
+		OnError(func(err error) error { return failure })
 	err := f.Start()
-	if err == nil || err.Error() != "fallback down" {
+	if !errors.Is(err, failure) {
 		t.Fatalf("expected fallback error, got %v", err)
 	}
 }

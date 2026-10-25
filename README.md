@@ -20,6 +20,8 @@ err := f.Start()
 - [Quick start](#quick-start)
 - [Core concepts](#core-concepts)
 - [Usage](#usage)
+  - [Validation](#validation)
+  - [Action names and errors](#action-names-and-errors)
   - [Passing data between actions](#passing-data-between-actions)
   - [Getting results out](#getting-results-out)
   - [Error handling and fallbacks](#error-handling-and-fallbacks)
@@ -105,6 +107,51 @@ Every attempt of every action runs through the same execution path: pre-executio
 
 ## Usage
 
+### Validation
+
+`Start()` and `StartWithResult()` validate the whole flow before executing any action. You can check a flow separately without running it:
+
+```go
+if err := f.Validate(); err != nil {
+	log.Fatal(err)
+}
+```
+
+Validation checks non-nil functions and policies, explicit argument types and counts, fallback signatures, predicate return types, and built-in policy settings. It also checks every parallel member, including members of a conditional group. Invalid later steps prevent earlier steps from causing side effects. Validation does not invoke actions, predicates, fallbacks, maps, custom policies, or hooks.
+
+Piped values can change through mapping, fallback, and conditional execution. Their exact types and counts are checked when they reach the predicate or receiving action, before that action or its policies run. This is runtime validation, not compile-time type safety. Custom policy configuration remains the policy author's responsibility.
+
+Negative durations and retry counts are rejected. Rate limits require `Per > 0` and `Burst >= 1`; circuit breakers require positive thresholds and durations. A concurrency limit must be positive and belong to a parallel group. Duplicate timeout policies, predicates, and concurrency settings on one action are rejected. Zero retry attempts retain the existing behavior of making only the initial call.
+
+### Action names and errors
+
+Name steps and parallel members so logs and failures identify meaningful operations:
+
+```go
+f.Do(fetchUser, userID).Named("fetch-user").With(retry)
+f.AddParallel(
+	flowm.Do(fetchProfile).Named("profile"),
+	flowm.Do(fetchPermissions).Named("permissions"),
+).Named("load-details").WithConcurrency(2)
+```
+
+An empty name uses the function name; unnamed parallel groups use `parallel`. `Action{Name: "...", Func: fn}` is also supported.
+
+Failures returned by the flow carry an `*ActionError`:
+
+```go
+err := f.Start()
+var failure *flowm.ActionError
+if errors.As(err, &failure) {
+	log.Printf("action=%s attempts=%d cause=%v", failure.Name, failure.Attempts, failure.Err)
+}
+if errors.Is(err, context.DeadlineExceeded) {
+	// Handle the underlying cause without matching error text.
+}
+```
+
+`Attempts` counts actual calls to the primary function, including retries. Validation and predicate failures, cancellation before execution, and attempts rejected by pre-execution policies count as zero calls. Fallback calls do not increase the count. A failed parallel group wraps joined, individually named member errors, preserving all underlying causes through `errors.Is` and `errors.As`. A recovered error still produces a successful flow; fallback functions continue to receive the underlying error before the action wrapper is added.
+
 ### Passing data between actions
 
 By default an action's return values are discarded. Three chainable methods forward them to the **next** action:
@@ -162,24 +209,26 @@ To mark an error as non-retryable, wrap it with `flowm.Permanent(err)` (or imple
 
 ### Conditional actions
 
-`When` runs an action only if a predicate accepts the previous action's piped results:
+`When` runs an action only if a predicate accepts the previous action's piped results. Predicates can receive those values directly in their original types:
 
 ```go
 f.Do(fetchScore).PipeAll() // fetchScore returns an int
 f.Do(func(score int) int {
 	sendAlert(score)
 	return score
-}).When(func(values []interface{}) bool {
-	return values[0].(int) > 90
+}).When(func(score int) bool {
+	return score > 90
 }).PipeAll()
 f.Do(logScore) // receives the score whether the alert ran or was skipped
 ```
 
 - Attach `When` to the action you want to conditionally run. Use `PipeAll`, `Pipe`, or `Map` on the producer to supply values to the predicate and action.
-- A false predicate skips the entire action, including its policies, fallbacks, and hooks. Incoming values remain available to the next action.
+- A false predicate skips the action, its policies and fallbacks, and its execution hooks. It fires `OnSkip(name)` exactly once. Incoming values remain available to the next action.
 - A true predicate runs the action normally and consumes the incoming values. Return and pipe values again if the following action needs them, as above.
-- The predicate runs once before the action, not on every retry. Without piped values it receives `nil`; it can also use values captured from your application.
-- `When` applies to top-level flow actions, including an entire `AddParallel` group. It does not gate individual parallel members.
+- The predicate runs once before the action, not on every retry, and must return exactly one boolean. It can accept multiple piped values, such as `func(id int, status string) bool`, and an optional leading `context.Context`.
+- The original `func([]interface{}) bool` form still receives the entire value list (`nil` when nothing was piped). Use `func() bool` for decisions based on captured state; it ignores piped values. A nil predicate leaves the action enabled.
+- A predicate panic or argument mismatch returns a named `ActionError` with zero attempts and emits `OnError`, not `OnSkip`. Predicate failures abort the flow before the action's retry or fallback policies run.
+- `When` applies to top-level actions and entire parallel groups. A group condition can inspect incoming values, but members receive their own explicit parameters. An executed group consumes the incoming values; a skipped group preserves them. Conditions on individual parallel members are rejected by validation.
 
 ### Retries
 
@@ -254,30 +303,35 @@ f.Do(callB).With(rl)
 
 ```go
 f.AddParallel(
-	flowm.Do(fetchName),
-	flowm.Do(fetchRole).With(rateLimiter),
-	flowm.Do(fetchTeam, teamID).OnError(fetchTeamFromCache),
-).PipeAll()
+	flowm.Do(fetchName).Named("name"),
+	flowm.Do(fetchRole).Named("role").With(rateLimiter),
+	flowm.Do(fetchTeam, teamID).Named("team").OnError(fetchTeamFromCache),
+).Named("fetch-details").WithConcurrency(2).PipeAll()
 f.Do(func(name, role, team string) { ... })
 ```
 
 - Results are flattened in **declaration order** (not completion order) and can be piped.
 - Per-action policies — including `OnError` fallbacks — apply inside the group.
-- Cap concurrency with `flowm.WorkerPoolPolicy{Size: 4}` on any member action.
-- If members fail, their errors are combined with `errors.Join`; `errors.Is`/`errors.As` find the individual errors.
+- `WithConcurrency(n)` sets a positive limit on the group. It creates at most `n` workers and limits the number of active member executions. Without a limit, all members may run concurrently. Timed-out functions must honor their contexts to stop their underlying work.
+- Legacy `WorkerPoolPolicy` values on members still work, but a group limit takes precedence. Conflicting member limits without a group limit fail validation; placing the limit on the group is preferred.
+- Cancellation prevents queued members from starting. Empty groups succeed with no member results.
+- If members fail, their named `ActionError` values are combined with `errors.Join` and wrapped in the group's `ActionError`; `errors.Is`/`errors.As` retain access to underlying failures.
 
 ### Observability hooks
 
 ```go
 f := flowm.New().WithHooks(flowm.Hooks{
 	OnStart:   func(name string) {},
+	OnSkip:    func(name string) {},
 	OnSuccess: func(name string, result []interface{}) {},
 	OnError:   func(name string, err error) {},
 	OnRetry:   func(name string, attempt int, err error) {},
 })
 ```
 
-Hooks observe every action in the flow (`name` is the function name). They cannot change outcomes — use policies for that. Use `StartWithResult()` to retrieve the final result directly.
+Hooks use the explicit action name when provided, otherwise the function name. `OnSkip` fires only when a `When` predicate returns false; skipped actions do not emit `OnStart`, `OnSuccess`, `OnError`, or `OnRetry`. Actions never reached because of an earlier failure do not emit `OnSkip`. Validation failures occur before execution hooks run. Execution-time `OnError` receives the structured `ActionError`.
+
+Hooks cannot change outcomes — use policies for that. Hooks invoked by parallel members must be safe for concurrent calls. Use `StartWithResult()` to retrieve the final result directly.
 
 ### Context propagation
 
@@ -334,28 +388,36 @@ type Flowm interface {
 	AddParallel(actions ...Action) Flowm
 
 	// configuring the last added action
+	Named(name string) Flowm
 	With(policy Policy) Flowm
 	PipeAll() Flowm
 	Pipe(indices ...int) Flowm
 	Map(mapper func([]interface{}) []interface{}) Flowm
 	ContinueOnError() Flowm
 	OnError(function interface{}, params ...interface{}) Flowm
-	When(pred func(piped []interface{}) bool) Flowm
+	When(predicate interface{}) Flowm
+	WithConcurrency(limit int) Flowm // last added parallel group
 
 	// configuring the flow
 	WithContext(ctx context.Context) Flowm
 	WithHooks(h Hooks) Flowm
 
 	// running
+	Validate() error
 	Start() error
 	StartWithResult() ([]interface{}, error)
 }
 
 // Action builders
-func Do(function interface{}, params ...interface{}) Action // chainable: .With, .OnError
+func Do(function interface{}, params ...interface{}) Action // chainable: .Named, .With, .OnError
 
 // Errors
 func Permanent(err error) error // mark non-retryable; unwrappable via errors.Is/As
+type ActionError struct {
+	Name     string
+	Attempts int
+	Err      error
+} // implements Error() and Unwrap()
 ```
 
 Built-in policies:
@@ -369,14 +431,14 @@ Built-in policies:
 | `FallbackPolicy{Func, Params}` | run an alternative function on failure (sugar: `OnError`) |
 | `ContinueOnErrorPolicy{Continue: true}` | swallow errors, keep the flow going (sugar: `ContinueOnError`) |
 | `ConditionPolicy{If}` | run a top-level action only when its predicate accepts the incoming values (sugar: `When`) |
-| `WorkerPoolPolicy{Size}` | cap concurrency inside `AddParallel` |
+| `WorkerPoolPolicy{Size}` | group concurrency limit (sugar: `WithConcurrency`); member placement is deprecated |
 | `PipeAllPolicy` / `PipeIndicesPolicy` / `PipeMapPolicy` | piping (sugar: `PipeAll` / `Pipe` / `Map`) |
 
 ## Behavior notes
 
 - **Policy order matters.** Policies run in attachment order: `.With(retry).OnError(fb)` retries first and falls back only when retries are exhausted; reversed, the fallback would run before the retry sees the error.
 - **Shared policy instances share state.** One `RateLimitPolicy` across actions = one global bucket; one `CircuitBreakerPolicy` = one shared breaker. Use separate instances for independent behavior. Built-in retry and fallback configuration is copied per invocation. Custom policies and hooks used by parallel members must be safe for concurrent calls.
-- **Reflection trade-off.** Parameter types and counts are checked at runtime, not compile time. A mismatch (or an untyped `nil` argument) surfaces as an error on `Start()`.
+- **Reflection trade-off.** Definitions and explicit arguments are validated before execution; dynamic piped arguments are validated when available. Nil is accepted for nil-capable parameters, and variadic functions accept individual arguments. This does not provide compile-time checking.
 - **Panics become errors.** A panic in an action or fallback is recovered and treated as a normal error — it can be retried, caught by `OnError`, or continued past.
 - **Non-retryable errors remain errors.** `Permanent` and `DoNotRetry` stop retries; handle the error with `OnError`, explicitly ignore it with `ContinueOnError`, or let `Start()` return it.
 - **Results come from `StartWithResult`, piping, or hooks.** `Start()` returns only `error`; use `StartWithResult()`, pipe into a consumer function, or the `OnSuccess` hook.
@@ -398,6 +460,8 @@ This cleanup intentionally breaks compatibility with the removed APIs. The packa
 | `MultiError` | Duplicated the standard library. Parallel failures now use `errors.Join`; inspect them with `errors.Is` / `errors.As` instead of asserting a concrete container type or matching its text. |
 
 `Permanent` / `DoNotRetry` now preserve the failure instead of silently succeeding. `RetryIf` and `Delay` now apply before the first retry as well as later retries. Parallel members also honor `ContinueOnErrorPolicy`, and piped parallel results exclude error values.
+
+The newer functionality adds `Named`, `Validate`, `WithConcurrency`, `ActionError`, and `Hooks.OnSkip`. Existing slice-based `When` calls continue to work, but custom implementations of `Flowm` must add the new methods and change their `When` signature to accept `interface{}`. Use keyed `Action` literals when constructing actions directly. `Start` now rejects invalid definitions before any action runs, and returned error text includes action names and attempt counts; inspect causes with `errors.Is`/`errors.As` instead of equality or string matching.
 
 ## Testing
 
