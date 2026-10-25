@@ -35,10 +35,7 @@ type Flowm interface {
 	ContinueOnError() Flowm
 	OnError(function interface{}, params ...interface{}) Flowm
 	When(pred func(piped []interface{}) bool) Flowm
-	Compensate(function interface{}, params ...interface{}) Flowm
 	AddParallel(actions ...Action) Flowm
-	DoFlow(sub Flowm) Flowm
-	ForEach(function interface{}, policies ...Policy) Flowm
 	Start() error
 	StartWithResult() ([]interface{}, error)
 }
@@ -60,8 +57,7 @@ func New() Flowm {
 }
 
 func (f *flowm) AddAction(act Action) {
-	name, _ := f.getFunctionName(act.Func)
-	f.stubStorage = append(f.stubStorage, stub{Name: name, Action: act})
+	f.stubStorage = append(f.stubStorage, stub{Name: functionNameOf(act.Func), Action: act})
 	f.lastIndex = len(f.stubStorage) - 1
 }
 
@@ -76,22 +72,16 @@ func (f *flowm) StartWithResult() ([]interface{}, error) {
 	var pipedValues []interface{}
 	hasPiped := false
 	var lastResult []interface{}
-	var compensations []stub
 	for i := range f.stubStorage {
 		st := f.stubStorage[i]
-		if cp := conditionPolicyOf(st.Action); cp != nil && cp.If != nil && !cp.If(pipedValues) {
-			// skipped actions are transparent: piped values stay available
+		if condition := conditionPolicyOf(st.Action); condition != nil && condition.If != nil && !condition.If(pipedValues) {
+			// A skipped action leaves the incoming values for the next action.
 			continue
 		}
-		if fe := forEachPolicyOf(st.Action); fe != nil {
-			st = f.buildForEachStub(st, fe, hasPiped, pipedValues)
-			hasPiped = false
-			pipedValues = nil
-		} else if hasPiped {
-			if st.Action.Params == nil {
-				st.Action.Params = []interface{}{}
-			}
-			st.Action.Params = append(st.Action.Params, pipedValues...)
+		if hasPiped {
+			params := make([]interface{}, 0, len(st.Action.Params)+len(pipedValues))
+			params = append(params, st.Action.Params...)
+			st.Action.Params = append(params, pipedValues...)
 			hasPiped = false
 			pipedValues = nil
 		}
@@ -106,92 +96,16 @@ func (f *flowm) StartWithResult() ([]interface{}, error) {
 				// swallow error and continue
 				continue
 			}
-			if cerr := f.runCompensations(compensations); cerr != nil {
-				return nil, errors.Join(err, cerr)
-			}
 			return nil, err
-		}
-		if compensatePolicyOf(st.Action) != nil {
-			compensations = append(compensations, st)
 		}
 	}
 	return filterErrorValues(lastResult), nil
 }
 
-// runCompensations executes registered compensations in reverse order.
-func (f *flowm) runCompensations(compensations []stub) error {
-	var errs []error
-	for i := len(compensations) - 1; i >= 0; i-- {
-		cp := compensatePolicyOf(compensations[i].Action)
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					errs = append(errs, fmt.Errorf("compensation panic: %v", r))
-				}
-			}()
-			if _, cerr := f.callFunc(cp.Func, cp.Params...); cerr != nil {
-				errs = append(errs, cerr)
-			}
-		}()
-	}
-	return errors.Join(errs...)
-}
-
-// buildForEachStub turns a ForEach action into a parallel group with one
-// member per piped element. A single piped slice is expanded into elements;
-// non-ForEach policies (piping, continue-on-error, ...) carry over to the group.
-func (f *flowm) buildForEachStub(st stub, fe *ForEachPolicy, hasPiped bool, pipedValues []interface{}) stub {
-	var elems []interface{}
-	if hasPiped {
-		elems = pipedValues
-		if len(pipedValues) == 1 {
-			rv := reflect.ValueOf(pipedValues[0])
-			if rv.IsValid() && (rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array) {
-				elems = make([]interface{}, rv.Len())
-				for j := 0; j < rv.Len(); j++ {
-					elems[j] = rv.Index(j).Interface()
-				}
-			}
-		}
-	}
-	acts := make([]Action, len(elems))
-	for j, e := range elems {
-		params := make([]interface{}, 0, len(st.Action.Params)+1)
-		params = append(params, st.Action.Params...)
-		params = append(params, e)
-		acts[j] = Action{Func: st.Action.Func, Params: params, Policies: fe.Policies}
-	}
-	par := f.newParallelAction(acts, nil)
-	for _, p := range st.Action.Policies {
-		if _, isFE := p.(*ForEachPolicy); !isFE {
-			par.Policies = append(par.Policies, p)
-		}
-	}
-	return stub{Name: st.Name, Action: par}
-}
-
-func conditionPolicyOf(a Action) *ConditionPolicy {
-	for _, p := range a.Policies {
-		if c, ok := p.(*ConditionPolicy); ok {
-			return c
-		}
-	}
-	return nil
-}
-
-func compensatePolicyOf(a Action) *CompensatePolicy {
-	for _, p := range a.Policies {
-		if c, ok := p.(*CompensatePolicy); ok {
-			return c
-		}
-	}
-	return nil
-}
-
-func forEachPolicyOf(a Action) *ForEachPolicy {
-	for _, p := range a.Policies {
-		if fe, ok := p.(*ForEachPolicy); ok {
-			return fe
+func conditionPolicyOf(action Action) *ConditionPolicy {
+	for _, policy := range action.Policies {
+		if condition, ok := policy.(*ConditionPolicy); ok {
+			return condition
 		}
 	}
 	return nil
@@ -207,14 +121,6 @@ func filterErrorValues(vals []interface{}) []interface{} {
 		filtered = append(filtered, v)
 	}
 	return filtered
-}
-
-func NewAction(function interface{}, Params []interface{}, Policy ...Policy) Action {
-	return Action{
-		Func:     function,
-		Params:   Params,
-		Policies: Policy,
-	}
 }
 
 // Do builds an Action with the same signature as Flowm.Do; attach policies by
@@ -236,12 +142,6 @@ func (a Action) With(policies ...Policy) Action {
 // OnError attaches a fallback function to the action, like Flowm.OnError.
 func (a Action) OnError(function interface{}, params ...interface{}) Action {
 	return a.With(&FallbackPolicy{Func: function, Params: params})
-}
-
-// Compensate attaches a rollback function to the action, like Flowm.Compensate.
-// Compensations are tracked for top-level flow actions, not parallel members.
-func (a Action) Compensate(function interface{}, params ...interface{}) Action {
-	return a.With(&CompensatePolicy{Func: function, Params: params})
 }
 
 func (f *flowm) callFunc(funcValue interface{}, params ...interface{}) (result []interface{}, err error) {
@@ -286,19 +186,16 @@ func callReflect(funcValue interface{}, params ...interface{}) (result []interfa
 }
 
 func (f *flowm) runSingleAction(st stub) (result []interface{}, err error, pipeNext bool, pipeVals []interface{}, continueOnErr bool) {
-	// propagate context to policies if supported
-	for _, p := range st.Action.Policies {
-		if cp, ok := p.(ContextAwarePolicy); ok {
-			cp.SetContext(f.ctx)
-		}
-		if rh, ok := p.(RetryHookAwarePolicy); ok {
-			if f.hooks != nil && f.hooks.OnRetry != nil {
-				rh.SetOnRetry(f.hooks.OnRetry)
-			}
-		}
-		if fa, ok := p.(FallbackAwarePolicy); ok {
-			fa.SetFlowCaller(f.callFunc)
-			fa.SetResultSink(func(res []interface{}) { result = res })
+	// Execution callbacks belong to this invocation, not shared configuration.
+	st.Action.Policies = append([]Policy(nil), st.Action.Policies...)
+	for i, p := range st.Action.Policies {
+		switch p := p.(type) {
+		case *RetryPolicy:
+			local := *p
+			st.Action.Policies[i] = &local
+		case *FallbackPolicy:
+			local := *p
+			st.Action.Policies[i] = &local
 		}
 	}
 	var perAttempt, overall time.Duration
@@ -308,9 +205,28 @@ func (f *flowm) runSingleAction(st stub) (result []interface{}, err error, pipeN
 			break
 		}
 	}
-	var overallDeadline time.Time
+	ctx := f.ctx
 	if overall > 0 {
-		overallDeadline = time.Now().Add(overall)
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, overall)
+		defer cancel()
+	}
+	// propagate context to policies if supported
+	for _, p := range st.Action.Policies {
+		if cp, ok := p.(ContextAwarePolicy); ok {
+			cp.SetContext(ctx)
+		}
+		if rh, ok := p.(RetryHookAwarePolicy); ok {
+			var onRetry func(string, int, error)
+			if f.hooks != nil {
+				onRetry = f.hooks.OnRetry
+			}
+			rh.SetOnRetry(onRetry)
+		}
+		if fa, ok := p.(FallbackAwarePolicy); ok {
+			fa.SetFlowCaller(f.callFunc)
+			fa.SetResultSink(func(res []interface{}) { result = res })
+		}
 	}
 	// executeOnce runs one full attempt: pre-execution checks (rate limit,
 	// circuit breaker), context injection, timeouts, and panic recovery. Both
@@ -332,28 +248,32 @@ func (f *flowm) runSingleAction(st stub) (result []interface{}, err error, pipeN
 				}
 			}
 		}()
-		timeout := perAttempt
-		if overall > 0 {
-			remaining := time.Until(overallDeadline)
-			if remaining <= 0 {
-				return nil, context.DeadlineExceeded
-			}
-			if timeout == 0 || remaining < timeout {
-				timeout = remaining
-			}
+		attemptCtx := ctx
+		if perAttempt > 0 {
+			var cancel context.CancelFunc
+			attemptCtx, cancel = context.WithTimeout(ctx, perAttempt)
+			defer cancel()
+		}
+		if err := attemptCtx.Err(); err != nil {
+			return nil, err
 		}
 		for _, p := range st.Action.Policies {
 			if pre, ok := p.(PreExecutionPolicy); ok {
-				if perr := pre.Before(f.ctx, st.Action); perr != nil {
+				if perr := pre.Before(attemptCtx, st.Action); perr != nil {
 					return nil, perr
 				}
 			}
 		}
-		executed = true
-		if timeout > 0 {
-			return f.callWithTimeout(st.Action, timeout)
+		if err := attemptCtx.Err(); err != nil {
+			return nil, err
 		}
-		return f.callFunc(st.Action.Func, st.Action.Params...)
+		executed = true
+		attemptFlow := *f
+		attemptFlow.ctx = attemptCtx
+		if attemptCtx.Done() != nil {
+			return attemptFlow.callWithContext(st.Action)
+		}
+		return attemptFlow.callFunc(st.Action.Func, st.Action.Params...)
 	}
 	for _, p := range st.Action.Policies {
 		if ea, ok := p.(ExecutorAwarePolicy); ok {
@@ -375,9 +295,6 @@ func (f *flowm) runSingleAction(st stub) (result []interface{}, err error, pipeN
 		if c, ok := policy.(*ContinueOnErrorPolicy); ok && c.Continue {
 			continueOnErr = true
 		}
-		if t, ok := policy.(*TerminatePolicy); ok && t.Terminate {
-			continueOnErr = true
-		}
 		err = policy.Do(st.Action, err)
 	}
 	if len(result) > 0 {
@@ -397,7 +314,7 @@ func (f *flowm) runSingleAction(st stub) (result []interface{}, err error, pipeN
 		}
 		for _, policy := range st.Action.Policies {
 			switch p := policy.(type) {
-			case *PassValuesPolicy, *PipeAllPolicy:
+			case *PipeAllPolicy:
 				setPipeAll(filtered)
 			case *PipeIndicesPolicy:
 				out := make([]interface{}, 0, len(p.Indices))
@@ -426,7 +343,7 @@ func (f *flowm) runSingleAction(st stub) (result []interface{}, err error, pipeN
 	return
 }
 
-func (f *flowm) callWithTimeout(a Action, perAttempt time.Duration) ([]interface{}, error) {
+func (f *flowm) callWithContext(a Action) ([]interface{}, error) {
 	type callRes struct {
 		res []interface{}
 		err error
@@ -446,22 +363,13 @@ func (f *flowm) callWithTimeout(a Action, perAttempt time.Duration) ([]interface
 		return nil, f.ctx.Err()
 	case out := <-ch:
 		return out.res, out.err
-	case <-time.After(perAttempt):
-		return nil, context.DeadlineExceeded
 	}
 }
 
-func (f *flowm) newParallelAction(actions []Action, reducer func([][]interface{}) []interface{}) Action {
-	if reducer == nil {
-		reducer = func(results [][]interface{}) []interface{} {
-			flat := []interface{}{}
-			for _, r := range results {
-				flat = append(flat, r...)
-			}
-			return flat
-		}
-	}
-	runner := func() ([]interface{}, error) {
+func (f *flowm) newParallelAction(actions []Action) Action {
+	runner := func(ctx context.Context) ([]interface{}, error) {
+		group := *f
+		group.ctx = ctx
 		type r struct {
 			res []interface{}
 			err error
@@ -482,46 +390,38 @@ func (f *flowm) newParallelAction(actions []Action, reducer func([][]interface{}
 			sem = make(chan struct{}, semSize)
 		}
 		for i := range actions {
-			i := i
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				if sem != nil {
-					sem <- struct{}{}
+					select {
+					case sem <- struct{}{}:
+					case <-ctx.Done():
+						out[i].err = ctx.Err()
+						return
+					}
 					defer func() { <-sem }()
 				}
 				st := stub{Name: functionNameOf(actions[i].Func), Action: actions[i]}
-				rres, rerr, _, _, _ := f.runSingleAction(st)
+				rres, rerr, _, _, continueOnErr := group.runSingleAction(st)
+				if continueOnErr {
+					rerr = nil
+				}
 				out[i] = r{res: rres, err: rerr}
 			}()
 		}
 		wg.Wait()
-		var merr MultiError
-		results := make([][]interface{}, len(out))
+		var errs []error
+		var results []interface{}
 		for i := range out {
 			if out[i].err != nil {
-				merr.Append(out[i].err)
+				errs = append(errs, out[i].err)
 			}
-			results[i] = out[i].res
+			results = append(results, filterErrorValues(out[i].res)...)
 		}
-		if merr.Len() > 0 {
-			return reducer(results), merr
-		}
-		return reducer(results), nil
+		return results, errors.Join(errs...)
 	}
-	return NewAction(runner, nil)
-}
-
-func (f *flowm) getFunctionName(i interface{}) (name string, isMethod bool) {
-	if fullName, ok := i.(string); ok {
-		return fullName, false
-	}
-	fullName := runtime.FuncForPC(reflect.ValueOf(i).Pointer()).Name()
-	isMethod = strings.ContainsAny(fullName, "*")
-	elements := strings.Split(fullName, ".")
-	shortName := elements[len(elements)-1]
-
-	return strings.TrimSuffix(shortName, "-fm"), isMethod
+	return Do(runner)
 }
 
 type Policy interface {
@@ -568,60 +468,24 @@ type RetryPolicy struct {
 	MaxDelay      time.Duration
 	BackoffFactor float64
 	Jitter        bool
-	Fn            func() error
 	RetryIf       func(error) bool
-	MaxElapsed    time.Duration
 	ctx           context.Context
 	onRetry       func(actionName string, attempt int, err error)
 	execute       func() ([]interface{}, error)
 }
 
-// PassValuesPolicy is deprecated: it behaves like PipeAllPolicy.
-type PassValuesPolicy struct{}
+type ContinueOnErrorPolicy struct{ Continue bool }
 
-func (r *PassValuesPolicy) Do(action Action, mainErr error) error {
-	return mainErr
-}
+func (c *ContinueOnErrorPolicy) Do(action Action, mainErr error) error { return mainErr }
 
-// ConditionPolicy skips the action when If returns false. The predicate
-// receives the values piped to this action (nil when nothing was piped);
-// skipped actions are transparent — piped values stay available for the next
-// action. Sugar: Flowm.When.
+// ConditionPolicy gates a top-level flow action using its incoming piped values.
+// A false predicate skips the action without consuming those values.
+// A nil predicate allows the action to run. Sugar: Flowm.When.
 type ConditionPolicy struct {
 	If func(piped []interface{}) bool
 }
 
 func (c *ConditionPolicy) Do(action Action, mainErr error) error { return mainErr }
-
-// CompensatePolicy registers a compensation (rollback) function for the
-// action. When a later action fails terminally, compensations of previously
-// succeeded actions run in reverse order. Sugar: Flowm.Compensate.
-type CompensatePolicy struct {
-	Func   interface{}
-	Params []interface{}
-}
-
-func (c *CompensatePolicy) Do(action Action, mainErr error) error { return mainErr }
-
-// ForEachPolicy marks an action added via Flowm.ForEach: its function runs
-// once per piped element (concurrently), with Policies applied per element.
-type ForEachPolicy struct {
-	Policies []Policy
-}
-
-func (fe *ForEachPolicy) Do(action Action, mainErr error) error { return mainErr }
-
-type TerminatePolicy struct {
-	Terminate bool
-}
-
-func (r *TerminatePolicy) Do(action Action, mainErr error) error {
-	return mainErr
-}
-
-type ContinueOnErrorPolicy struct{ Continue bool }
-
-func (c *ContinueOnErrorPolicy) Do(action Action, mainErr error) error { return mainErr }
 
 // FallbackPolicy runs an alternative function when the action fails. If the
 // fallback succeeds, the error is swallowed and the fallback's return values
@@ -780,7 +644,7 @@ func (r *RateLimitPolicy) Before(ctx context.Context, action Action) error {
 		now := time.Now()
 		elapsed := now.Sub(r.last).Seconds()
 		ratePerSec := 1.0 / r.Per.Seconds()
-		r.tokens = minFloat(r.tokens+elapsed*ratePerSec, float64(r.Burst))
+		r.tokens = min(r.tokens+elapsed*ratePerSec, float64(r.Burst))
 		r.last = now
 		if r.tokens >= 1.0 {
 			r.tokens -= 1.0
@@ -807,76 +671,68 @@ func (r *RetryPolicy) SetOnRetry(fn func(actionName string, attempt int, err err
 func (r *RetryPolicy) SetExecutor(fn func() ([]interface{}, error))                  { r.execute = fn }
 
 func (r *RetryPolicy) Do(action Action, mainErr error) error {
-	if mainErr == nil {
-		return nil
-	}
-	var dnr DoNotRetry
-	if errors.As(mainErr, &dnr) {
-		return nil
-	}
-	// Attempts counts total tries including the original call already made
-	if r.Attempts <= 1 {
+	if mainErr == nil || r.Attempts <= 1 {
 		return mainErr
 	}
 	ctx := r.ctx
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	start := time.Now()
 	delay := r.Delay
 	lastErr := mainErr
 	for attempt := 2; attempt <= r.Attempts; attempt++ {
-		if r.MaxElapsed > 0 && time.Since(start) > r.MaxElapsed {
-			break
+		var dnr DoNotRetry
+		if errors.As(lastErr, &dnr) || (r.RetryIf != nil && !r.RetryIf(lastErr)) {
+			return lastErr
 		}
-		if r.Fn != nil {
-			if err := r.Fn(); err != nil {
-				// pre-check failed: stop retrying, keep the underlying error
-				return lastErr
-			}
-		}
-		if r.BackoffFactor > 1 {
-			delay = time.Duration(float64(delay) * r.BackoffFactor)
-		}
-		if r.MaxDelay > 0 && delay > r.MaxDelay {
-			delay = r.MaxDelay
-		}
+		wait := delay
 		if r.Jitter {
-			delay = time.Duration(float64(delay) * (0.5 + rand.Float64()/2))
+			wait = retryDelay(wait, 0.5+rand.Float64())
+		}
+		if r.MaxDelay > 0 && wait > r.MaxDelay {
+			wait = r.MaxDelay
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		var callErr error
 		if r.execute != nil {
 			_, callErr = r.execute()
 		} else {
-			// standalone use outside a flow: no executor injected
 			_, callErr = callReflect(action.Func, action.Params...)
 		}
-		if callErr == nil {
-			if r.onRetry != nil {
-				r.onRetry(functionNameOf(action.Func), attempt, nil)
-			}
-			return nil
-		}
-		lastErr = callErr
 		if r.onRetry != nil {
 			r.onRetry(functionNameOf(action.Func), attempt, callErr)
 		}
-		if errors.As(callErr, &dnr) {
+		if callErr == nil {
 			return nil
 		}
-		if r.RetryIf != nil && !r.RetryIf(callErr) {
-			break
-		}
-		if attempt == r.Attempts {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(delay):
+		lastErr = callErr
+		if r.BackoffFactor > 1 {
+			delay = retryDelay(delay, r.BackoffFactor)
 		}
 	}
 	return lastErr
+}
+
+// Saturate backoff and jitter instead of overflowing into an immediate retry.
+func retryDelay(delay time.Duration, factor float64) time.Duration {
+	const maxDuration = time.Duration(1<<63 - 1)
+	next := float64(delay) * factor
+	if next >= float64(maxDuration) {
+		return maxDuration
+	}
+	return time.Duration(next)
 }
 
 type DoNotRetry interface {
@@ -890,8 +746,8 @@ func (p permanentError) Unwrap() error { return p.err }
 func (p permanentError) DoNotRetry()   {}
 
 // Permanent marks err as non-retryable: RetryPolicy stops retrying when it
-// sees it (directly or wrapped) and treats the action as handled. Returns nil
-// for a nil err. errors.Is and errors.As keep working through the wrapper.
+// sees it (directly or wrapped) and preserves it for the caller or fallback.
+// Returns nil for a nil err. errors.Is and errors.As work through the wrapper.
 func Permanent(err error) error {
 	if err == nil {
 		return nil
@@ -899,50 +755,15 @@ func Permanent(err error) error {
 	return permanentError{err: err}
 }
 
-type MultiError struct{ errs []error }
-
-func (m *MultiError) Append(err error) {
-	if err != nil {
-		m.errs = append(m.errs, err)
-	}
-}
-
-func (m MultiError) Error() string {
-	if len(m.errs) == 0 {
-		return ""
-	}
-	if len(m.errs) == 1 {
-		return m.errs[0].Error()
-	}
-	b := strings.Builder{}
-	b.WriteString("multiple errors: ")
-	for i, e := range m.errs {
-		if i > 0 {
-			b.WriteString("; ")
-		}
-		b.WriteString(e.Error())
-	}
-	return b.String()
-}
-
-func (m MultiError) Len() int { return len(m.errs) }
-
-// Unwrap supports errors.Is and errors.As over the collected errors.
-func (m MultiError) Unwrap() []error { return m.errs }
-
 func functionNameOf(fn interface{}) string {
-	fullName := runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name()
+	value := reflect.ValueOf(fn)
+	if !value.IsValid() || value.Kind() != reflect.Func || value.IsNil() {
+		return fmt.Sprintf("%T", fn)
+	}
+	fullName := runtime.FuncForPC(value.Pointer()).Name()
 	elems := strings.Split(fullName, ".")
 	short := elems[len(elems)-1]
 	return strings.TrimSuffix(short, "-fm")
-}
-
-func minFloat(a, b float64) float64 {
-	if a < b {
-		return a
-	} else {
-		return b
-	}
 }
 
 type Hooks struct {
@@ -967,7 +788,7 @@ func (f *flowm) WithHooks(h Hooks) Flowm {
 
 // Fluent builder helpers
 func (f *flowm) Do(function interface{}, params ...interface{}) Flowm {
-	f.AddAction(NewAction(function, params))
+	f.AddAction(Do(function, params...))
 	return f
 }
 
@@ -995,40 +816,15 @@ func (f *flowm) OnError(function interface{}, params ...interface{}) Flowm {
 	return f.With(&FallbackPolicy{Func: function, Params: params})
 }
 
-// When makes the last added action conditional: it is skipped (transparently
-// for piping) unless pred returns true. pred receives the values piped to the
-// action, nil when nothing was piped.
+// When runs the last added action only if pred accepts its incoming piped values.
+// The predicate receives nil when nothing was piped. Skipping the action leaves
+// the values available for the next action.
 func (f *flowm) When(pred func(piped []interface{}) bool) Flowm {
 	return f.With(&ConditionPolicy{If: pred})
 }
 
-// Compensate registers a rollback function for the last added action; it runs
-// (in reverse registration order) when a later action fails terminally.
-func (f *flowm) Compensate(function interface{}, params ...interface{}) Flowm {
-	return f.With(&CompensatePolicy{Func: function, Params: params})
-}
-
-// DoFlow embeds another flow as a single action: the subflow runs with this
-// flow's context, and its final results become this step's outputs (pipeable).
-func (f *flowm) DoFlow(sub Flowm) Flowm {
-	runner := func(ctx context.Context) ([]interface{}, error) {
-		sub.WithContext(ctx)
-		return sub.StartWithResult()
-	}
-	f.AddAction(NewAction(runner, nil))
-	return f
-}
-
-// ForEach runs function once per piped element, concurrently, and merges the
-// results in element order for piping onward. A single piped slice is expanded
-// into its elements. policies apply per element (e.g. WorkerPoolPolicy, retry).
-func (f *flowm) ForEach(function interface{}, policies ...Policy) Flowm {
-	f.AddAction(Action{Func: function, Policies: []Policy{&ForEachPolicy{Policies: policies}}})
-	return f
-}
-
 func (f *flowm) AddParallel(actions ...Action) Flowm {
-	par := f.newParallelAction(actions, nil)
+	par := f.newParallelAction(actions)
 	f.AddAction(par)
 	return f
 }

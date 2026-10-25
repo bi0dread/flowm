@@ -23,27 +23,25 @@ err := f.Start()
   - [Passing data between actions](#passing-data-between-actions)
   - [Getting results out](#getting-results-out)
   - [Error handling and fallbacks](#error-handling-and-fallbacks)
-  - [Compensation (saga rollback)](#compensation-saga-rollback)
   - [Conditional actions](#conditional-actions)
   - [Retries](#retries)
   - [Timeouts](#timeouts)
   - [Circuit breaker](#circuit-breaker)
   - [Rate limiting](#rate-limiting)
   - [Parallel execution](#parallel-execution)
-  - [ForEach fan-out](#foreach-fan-out)
-  - [Subflows](#subflows)
   - [Observability hooks](#observability-hooks)
   - [Context propagation](#context-propagation)
   - [Custom policies](#custom-policies)
 - [API reference](#api-reference)
 - [Behavior notes](#behavior-notes)
+- [Migration from the previous API](#migration-from-the-previous-api)
 - [Testing](#testing)
 - [License](#license)
 
 ## Why flowm
 
 - **One execution path, many policies.** Every attempt — first call, retry, or parallel branch — runs through the same pipeline: pre-execution checks, context injection, timeouts, and panic recovery. Policies compose correctly because they all see the same path.
-- **Catch-style fallbacks and saga rollback.** Chain `OnError` handlers like nested `catch` blocks, and register `Compensate` functions that undo completed steps when a later one fails.
+- **Explicit failure handling.** Chain `OnError` fallbacks, or opt into `ContinueOnError`. Non-retryable errors still reach the caller.
 - **Zero dependencies.** Single package, standard library only.
 
 ## Installation
@@ -99,11 +97,11 @@ func main() {
 | Concept | What it is |
 |---|---|
 | **Flow** | An ordered list of actions, executed sequentially by `Start()`. Stops at the first unhandled error. |
-| **Action** | A function plus its parameters and attached policies. Any signature works; calls go through reflection. |
+| **Action** | A function plus its parameters and attached policies. Calls go through reflection. |
 | **Policy** | A behavior attached to an action: retry, timeout, fallback, rate limit, … Policies are plain interfaces, so you can write your own. |
 | **Piping** | Opt-in forwarding of an action's return values into the next action's parameters. |
 
-Every attempt of every action runs through the same execution path: pre-execution policy checks → context injection → the call (bounded by a per-attempt timeout if configured) → panic recovery. Retries and fallbacks reuse this path, so all policies apply consistently.
+Every attempt of every action runs through the same execution path: pre-execution policy checks → context injection → the call (bounded by a per-attempt timeout if configured) → panic recovery. Retries reuse this path. Fallbacks receive context and panic recovery, but do not inherit the failed action’s retry, timeout, or pre-execution policies.
 
 ## Usage
 
@@ -160,35 +158,28 @@ Fallback semantics:
 - Combine with retry: `.With(retry).OnError(fb)` runs the fallback only after retries are exhausted.
 - Errors don't survive piping (see above) — to forward error details downstream, convert them to a value: `func(err error) (string, string) { return "fallback", err.Error() }`.
 
-To mark an error as non-retryable, wrap it with `flowm.Permanent(err)` (or implement the `DoNotRetry` interface). `RetryPolicy` stops retrying when it sees one — even wrapped, via `errors.As` — and treats the action as handled. `errors.Is`/`errors.As` keep working through the wrapper.
-
-### Compensation (saga rollback)
-
-Register an undo function per action; when a **later** action fails terminally, compensations of all previously succeeded actions run in **reverse order**:
-
-```go
-f := flowm.New()
-f.Do(createOrder).Compensate(cancelOrder)
-f.Do(chargeCard).Compensate(refundCard)
-f.Do(shipOrder) // fails → refundCard runs, then cancelOrder
-err := f.Start() // the original failure; compensation errors are errors.Join-ed onto it
-```
-
-- Only actions that **succeeded** are compensated — the failed action itself is not.
-- Compensations receive context injection like any function; a panicking compensation is recovered and reported.
-- Compensations are tracked for top-level flow actions (not individual parallel members).
+To mark an error as non-retryable, wrap it with `flowm.Permanent(err)` (or implement the `DoNotRetry` interface). `RetryPolicy` stops retrying when it sees one — even wrapped, via `errors.As` — and preserves the error for `OnError` or the caller. `errors.Is`/`errors.As` keep working through the wrapper.
 
 ### Conditional actions
 
-`When` skips an action unless a predicate over its incoming piped values returns true. Skipped actions are transparent: piped values stay available for the next action.
+`When` runs an action only if a predicate accepts the previous action's piped results:
 
 ```go
-f.Do(fetchScore).PipeAll()
-f.Do(sendAlert).When(func(piped []interface{}) bool {
-	return piped[0].(int) > 90 // alert only on high scores
-})
-f.Do(logScore) // receives the piped score whether or not the alert ran
+f.Do(fetchScore).PipeAll() // fetchScore returns an int
+f.Do(func(score int) int {
+	sendAlert(score)
+	return score
+}).When(func(values []interface{}) bool {
+	return values[0].(int) > 90
+}).PipeAll()
+f.Do(logScore) // receives the score whether the alert ran or was skipped
 ```
+
+- Attach `When` to the action you want to conditionally run. Use `PipeAll`, `Pipe`, or `Map` on the producer to supply values to the predicate and action.
+- A false predicate skips the entire action, including its policies, fallbacks, and hooks. Incoming values remain available to the next action.
+- A true predicate runs the action normally and consumes the incoming values. Return and pipe values again if the following action needs them, as above.
+- The predicate runs once before the action, not on every retry. Without piped values it receives `nil`; it can also use values captured from your application.
+- `When` applies to top-level flow actions, including an entire `AddParallel` group. It does not gate individual parallel members.
 
 ### Retries
 
@@ -200,8 +191,6 @@ retry := &flowm.RetryPolicy{
 	MaxDelay:      2 * time.Second,         // backoff ceiling
 	Jitter:        true,                    // randomize each delay by ±50%
 	RetryIf:       func(err error) bool { return isTransient(err) },
-	Fn:            func() error { return nil }, // pre-check before each retry; error = stop retrying
-	MaxElapsed:    10 * time.Second,        // total time budget for all retries
 }
 f.Do(callAPI).With(retry)
 ```
@@ -210,8 +199,9 @@ Behavior:
 
 - Retries run through the full execution path: context injection, per-attempt `TimeoutPolicy`, pre-execution policies (rate limit, circuit breaker), and panic recovery apply to **every** attempt.
 - A successful retry's return values are the ones piped to the next action.
-- If `Fn` returns an error, retrying stops and the last call error is returned.
-- `RetryIf` returning false stops further retries.
+- `RetryIf` is checked before every retry, including the first. Returning false preserves the last error.
+- `Delay` applies before the first retry; `BackoffFactor` increases later delays. `MaxDelay` caps the wait, including jitter.
+- Use `TimeoutPolicy.Overall` for an action budget or `WithContext` for a flow budget.
 - `Permanent`/`DoNotRetry` errors stop retrying immediately — on the initial call or mid-retry.
 - The `OnRetry` hook (see [hooks](#observability-hooks)) fires on every retry attempt.
 
@@ -224,7 +214,7 @@ f.Do(slowCall).With(&flowm.TimeoutPolicy{
 })
 ```
 
-On expiry an attempt fails with `context.DeadlineExceeded`; once the `Overall` budget is spent, remaining retry attempts fail immediately. The flow's context cancels waits as well.
+The attempt deadline is injected into context-aware functions and pre-execution policies. On expiry an attempt fails with `context.DeadlineExceeded`. `Overall` covers attempts, rate-limit waits, and retry delays; exhaustion stops further attempts. Fallbacks use the parent flow context so they can still recover from an action timeout.
 
 > Note: the underlying goroutine is not forcibly stopped — pass a context and honor it in your function for cooperative cancellation.
 
@@ -274,36 +264,7 @@ f.Do(func(name, role, team string) { ... })
 - Results are flattened in **declaration order** (not completion order) and can be piped.
 - Per-action policies — including `OnError` fallbacks — apply inside the group.
 - Cap concurrency with `flowm.WorkerPoolPolicy{Size: 4}` on any member action.
-- If members fail, their errors are collected into a single `MultiError`; `errors.Is`/`errors.As` see through it to the individual errors.
-- `NewAction(fn, []interface{}{...}, policies...)` is the equivalent non-chaining constructor.
-
-### ForEach fan-out
-
-`ForEach` runs a function once per piped element, concurrently, and merges the results in element order for piping onward. A single piped slice is expanded into its elements:
-
-```go
-f.Do(listUserIDs).PipeAll()                  // returns []int
-f.ForEach(fetchUser, &flowm.WorkerPoolPolicy{Size: 4}).PipeAll()
-f.Do(renderUsers)                            // receives one value per user
-```
-
-Policies passed to `ForEach` apply per element (retry, rate limit, worker pool, …). An empty piped collection is a no-op.
-
-### Subflows
-
-`DoFlow` embeds a whole flow as a single action of another. The subflow runs with the parent's context, and its final results become the step's pipeable outputs:
-
-```go
-enrichment := flowm.New()
-enrichment.Do(fetchProfile).With(retry).PipeAll()
-enrichment.Do(mergeProfile)
-
-f := flowm.New().WithContext(ctx)
-f.DoFlow(enrichment).PipeAll()
-f.Do(save)
-```
-
-This lets you build a library of reusable, pre-policied flows. A subflow instance holds state (context), so don't share one across concurrently running parents.
+- If members fail, their errors are combined with `errors.Join`; `errors.Is`/`errors.As` find the individual errors.
 
 ### Observability hooks
 
@@ -316,7 +277,7 @@ f := flowm.New().WithHooks(flowm.Hooks{
 })
 ```
 
-Hooks observe every action in the flow (`name` is the function name). They cannot change outcomes — use policies for that. `OnSuccess` is also the way to read a flow's final results, since `Start()` returns only an error.
+Hooks observe every action in the flow (`name` is the function name). They cannot change outcomes — use policies for that. Use `StartWithResult()` to retrieve the final result directly.
 
 ### Context propagation
 
@@ -327,7 +288,7 @@ f := flowm.New().WithContext(ctx)
 ```
 
 - If a function's first parameter is `context.Context` and you supplied one fewer argument, the flow's context is injected automatically — on the initial call and on every retry.
-- Cancellation is honored while waiting on retry delays, rate-limit tokens, and per-attempt timeouts.
+- Cancellation is checked before executing an action and honored while waiting on retry delays, rate-limit tokens, worker slots, and action calls.
 
 ### Custom policies
 
@@ -371,8 +332,6 @@ type Flowm interface {
 	Do(function interface{}, params ...interface{}) Flowm
 	AddAction(action Action)
 	AddParallel(actions ...Action) Flowm
-	DoFlow(sub Flowm) Flowm
-	ForEach(function interface{}, policies ...Policy) Flowm
 
 	// configuring the last added action
 	With(policy Policy) Flowm
@@ -382,7 +341,6 @@ type Flowm interface {
 	ContinueOnError() Flowm
 	OnError(function interface{}, params ...interface{}) Flowm
 	When(pred func(piped []interface{}) bool) Flowm
-	Compensate(function interface{}, params ...interface{}) Flowm
 
 	// configuring the flow
 	WithContext(ctx context.Context) Flowm
@@ -394,8 +352,7 @@ type Flowm interface {
 }
 
 // Action builders
-func NewAction(function interface{}, params []interface{}, policies ...Policy) Action
-func Do(function interface{}, params ...interface{}) Action // chainable: .With, .OnError, .Compensate
+func Do(function interface{}, params ...interface{}) Action // chainable: .With, .OnError
 
 // Errors
 func Permanent(err error) error // mark non-retryable; unwrappable via errors.Is/As
@@ -405,27 +362,42 @@ Built-in policies:
 
 | Policy | Effect |
 |---|---|
-| `RetryPolicy{Attempts, Delay, BackoffFactor, MaxDelay, Jitter, RetryIf, Fn, MaxElapsed}` | retry failed attempts with backoff |
-| `TimeoutPolicy{PerAttempt}` | bound each attempt's duration |
+| `RetryPolicy{Attempts, Delay, BackoffFactor, MaxDelay, Jitter, RetryIf}` | retry failed attempts with backoff |
+| `TimeoutPolicy{PerAttempt, Overall}` | bound each attempt and the total action budget |
 | `CircuitBreakerPolicy{Failures, Window, Cooldown}` | fail fast after repeated failures |
 | `RateLimitPolicy{Per, Burst}` | token-bucket throttling |
 | `FallbackPolicy{Func, Params}` | run an alternative function on failure (sugar: `OnError`) |
 | `ContinueOnErrorPolicy{Continue: true}` | swallow errors, keep the flow going (sugar: `ContinueOnError`) |
-| `ConditionPolicy{If}` | skip the action unless the predicate passes (sugar: `When`) |
-| `CompensatePolicy{Func, Params}` | rollback function for saga-style flows (sugar: `Compensate`) |
-| `WorkerPoolPolicy{Size}` | cap concurrency inside `AddParallel` and `ForEach` |
+| `ConditionPolicy{If}` | run a top-level action only when its predicate accepts the incoming values (sugar: `When`) |
+| `WorkerPoolPolicy{Size}` | cap concurrency inside `AddParallel` |
 | `PipeAllPolicy` / `PipeIndicesPolicy` / `PipeMapPolicy` | piping (sugar: `PipeAll` / `Pipe` / `Map`) |
-
-Deprecated, kept for backward compatibility: `TerminatePolicy` (behaves like continue-on-error), `PassValuesPolicy` (behaves like `PipeAllPolicy`).
 
 ## Behavior notes
 
 - **Policy order matters.** Policies run in attachment order: `.With(retry).OnError(fb)` retries first and falls back only when retries are exhausted; reversed, the fallback would run before the retry sees the error.
-- **Shared policy instances share state.** One `RateLimitPolicy` across actions = one global bucket; one `CircuitBreakerPolicy` = one shared breaker. Use separate instances for independent behavior.
+- **Shared policy instances share state.** One `RateLimitPolicy` across actions = one global bucket; one `CircuitBreakerPolicy` = one shared breaker. Use separate instances for independent behavior. Built-in retry and fallback configuration is copied per invocation. Custom policies and hooks used by parallel members must be safe for concurrent calls.
 - **Reflection trade-off.** Parameter types and counts are checked at runtime, not compile time. A mismatch (or an untyped `nil` argument) surfaces as an error on `Start()`.
-- **Panics become errors.** A panic in an action, fallback, or compensation is recovered and treated as a normal error — it can be retried, caught by `OnError`, or continued past.
-- **`Permanent`/`DoNotRetry` errors are swallowed.** When retrying stops on a non-retryable error, `RetryPolicy` treats the action as handled and the flow continues without an error — attach `OnError` if you need to react to it.
+- **Panics become errors.** A panic in an action or fallback is recovered and treated as a normal error — it can be retried, caught by `OnError`, or continued past.
+- **Non-retryable errors remain errors.** `Permanent` and `DoNotRetry` stop retries; handle the error with `OnError`, explicitly ignore it with `ContinueOnError`, or let `Start()` return it.
 - **Results come from `StartWithResult`, piping, or hooks.** `Start()` returns only `error`; use `StartWithResult()`, pipe into a consumer function, or the `OnSuccess` hook.
+
+## Migration from the previous API
+
+This cleanup intentionally breaks compatibility with the removed APIs. The package keeps function sequencing, conditional actions, and resilience; iteration and rollback stay in ordinary Go code.
+
+| Removed API | Reason and replacement |
+|---|---|
+| `Compensate` / `CompensatePolicy` (including `Action.Compensate`) | Top-level-only rollback cannot safely promise transaction semantics. Handle cleanup explicitly in application code. |
+| `ForEach` / `ForEachPolicy` | Implicit concurrent fan-out reused mutable policy instances. Use a loop or build explicit `Action` values for `AddParallel`. |
+| `DoFlow` | Mutated the child flow's context. Compose ordinary functions, or use `Do(sub.StartWithResult)` with the child's context configured explicitly. |
+| `NewAction(fn, params, policies...)` | Duplicate constructor. Use `Do(fn, params...).With(policies...)`. |
+| `TerminatePolicy` | Its name suggested stopping, but it continued after errors. Use `ContinueOnError()`. |
+| `PassValuesPolicy` | Deprecated duplicate. Use `PipeAll()` or `PipeAllPolicy`. |
+| `RetryPolicy.Fn` | Duplicate retry gate. Use `RetryIf`; use a `PreExecutionPolicy` for checks before every attempt. |
+| `RetryPolicy.MaxElapsed` | Overlapping budget that did not cover the initial attempt or bound waits. Use `TimeoutPolicy.Overall` or a context deadline. |
+| `MultiError` | Duplicated the standard library. Parallel failures now use `errors.Join`; inspect them with `errors.Is` / `errors.As` instead of asserting a concrete container type or matching its text. |
+
+`Permanent` / `DoNotRetry` now preserve the failure instead of silently succeeding. `RetryIf` and `Delay` now apply before the first retry as well as later retries. Parallel members also honor `ContinueOnErrorPolicy`, and piped parallel results exclude error values.
 
 ## Testing
 
