@@ -4,11 +4,14 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/bi0dread/flowm)](https://goreportcard.com/report/github.com/bi0dread/flowm)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**flowm** is a lightweight, zero-dependency Go library for orchestrating sequences of function calls with composable resilience policies — retries, timeouts, circuit breakers, rate limits, fallbacks, and parallel execution — behind a fluent builder API.
+**flowm** is a lightweight, zero-dependency Go library for orchestrating sequences of function calls with composable resilience policies — retries, timeouts, circuit breakers, rate limits, outcome routing, and parallel execution — behind a fluent builder API.
 
 ```go
 f := flowm.New().WithContext(ctx)
-f.Do(fetchLive).With(retry).OnError(fetchCache).PipeAll()
+f.Do(fetchLive).With(retry).When(
+	func(out flowm.Outcome) bool { return out.Err != nil },
+	flowm.Do(fetchCache),
+).PipeAll()
 f.Do(process)
 err := f.Start()
 ```
@@ -24,8 +27,7 @@ err := f.Start()
   - [Action names and errors](#action-names-and-errors)
   - [Passing data between actions](#passing-data-between-actions)
   - [Getting results out](#getting-results-out)
-  - [Error handling and fallbacks](#error-handling-and-fallbacks)
-  - [Conditional actions](#conditional-actions)
+  - [Outcome routing](#outcome-routing)
   - [Retries](#retries)
   - [Timeouts](#timeouts)
   - [Circuit breaker](#circuit-breaker)
@@ -43,7 +45,7 @@ err := f.Start()
 ## Why flowm
 
 - **One execution path, many policies.** Every attempt — first call, retry, or parallel branch — runs through the same pipeline: pre-execution checks, context injection, timeouts, and panic recovery. Policies compose correctly because they all see the same path.
-- **Explicit failure handling.** Chain `OnError` fallbacks, or opt into `ContinueOnError`. Non-retryable errors still reach the caller.
+- **Explicit outcome routing.** Use `When` to choose the next action after success or failure. Unmatched errors reach the caller unless explicitly ignored.
 - **Zero dependencies.** Single package, standard library only.
 
 ## Installation
@@ -100,10 +102,10 @@ func main() {
 |---|---|
 | **Flow** | An ordered list of actions, executed sequentially by `Start()`. Stops at the first unhandled error. |
 | **Action** | A function plus its parameters and attached policies. Calls go through reflection. |
-| **Policy** | A behavior attached to an action: retry, timeout, fallback, rate limit, … Policies are plain interfaces, so you can write your own. |
+| **Policy** | A behavior attached to an action: retry, timeout, rate limit, … Policies are plain interfaces, so you can write your own. |
 | **Piping** | Opt-in forwarding of an action's return values into the next action's parameters. |
 
-Every attempt of every action runs through the same execution path: pre-execution policy checks → context injection → the call (bounded by a per-attempt timeout if configured) → panic recovery. Retries reuse this path. Fallbacks receive context and panic recovery, but do not inherit the failed action’s retry, timeout, or pre-execution policies.
+Every attempt of every action runs through the same execution path: pre-execution policy checks → context injection → the call (bounded by a per-attempt timeout if configured) → panic recovery. Retries reuse this path. After the action and its policies finish, `When` rules inspect its final outcome. A selected branch runs through the same execution path with its own policies.
 
 ## Usage
 
@@ -117,11 +119,11 @@ if err := f.Validate(); err != nil {
 }
 ```
 
-Validation checks non-nil functions and policies, explicit argument types and counts, fallback signatures, predicate return types, and built-in policy settings. It also checks every parallel member, including members of a conditional group. Invalid later steps prevent earlier steps from causing side effects. Validation does not invoke actions, predicates, fallbacks, maps, custom policies, or hooks.
+Validation checks non-nil functions and policies, explicit argument types and counts, non-nil route predicates, branch definitions, and built-in policy settings. It also checks every parallel member and every nested branch, including branches that will not be selected. Invalid later steps prevent earlier steps from causing side effects. Validation does not invoke actions, predicates, branches, maps, custom policies, or hooks.
 
-Piped values can change through mapping, fallback, and conditional execution. Their exact types and counts are checked when they reach the predicate or receiving action, before that action or its policies run. This is runtime validation, not compile-time type safety. Custom policy configuration remains the policy author's responsibility.
+Piped values can change through mapping and outcome routing. Their exact types and counts are checked before the receiving action or its policies run. Predicates have the fixed signature `func(Outcome) bool`; branch parameters can optionally request the source `Outcome`. This is runtime validation, not compile-time type safety. Custom policy configuration remains the policy author's responsibility.
 
-Negative durations and retry counts are rejected. Rate limits require `Per > 0` and `Burst >= 1`; circuit breakers require positive thresholds and durations. A concurrency limit must be positive and belong to a parallel group. Duplicate timeout policies, predicates, and concurrency settings on one action are rejected. Zero retry attempts retain the existing behavior of making only the initial call.
+Negative durations and retry counts are rejected. Rate limits require `Per > 0` and `Burst >= 1`; circuit breakers require positive thresholds and durations. A concurrency limit must be positive and belong to a parallel group. Duplicate timeout policies and concurrency settings on one action are rejected. Multiple `When` rules are allowed and evaluated in registration order. Zero retry attempts retain the existing behavior of making only the initial call.
 
 ### Action names and errors
 
@@ -150,7 +152,7 @@ if errors.Is(err, context.DeadlineExceeded) {
 }
 ```
 
-`Attempts` counts actual calls to the primary function, including retries. Validation and predicate failures, cancellation before execution, and attempts rejected by pre-execution policies count as zero calls. Fallback calls do not increase the count. A failed parallel group wraps joined, individually named member errors, preserving all underlying causes through `errors.Is` and `errors.As`. A recovered error still produces a successful flow; fallback functions continue to receive the underlying error before the action wrapper is added.
+`Attempts` counts actual calls to that action, including retries. Each selected branch has its own name and attempt count. Validation and predicate failures, cancellation before execution, and attempts rejected by pre-execution policies count as zero calls. A failed parallel group wraps joined, individually named member errors, preserving their causes through `errors.Is` and `errors.As`. If a branch fails, the returned error identifies that branch. `Outcome.Err` contains the underlying error; error hooks and the flow's returned errors add the `ActionError` wrapper.
 
 ### Passing data between actions
 
@@ -181,54 +183,70 @@ f.Do(compute)
 results, err := f.StartWithResult() // []interface{} of compute's outputs
 ```
 
-### Error handling and fallbacks
+### Outcome routing
 
-By default the first error aborts the flow and `Start()` returns it.
-
-```go
-// Swallow the error and keep going (the error is discarded):
-f.Do(risky).ContinueOnError()
-
-// Catch-style fallback chain — each handler runs only if everything before it failed:
-f.Do(fetchLive).
-	OnError(fetchCache).   // receives fetchLive's error
-	OnError(fetchDefault). // receives fetchCache's error
-	PipeAll()              // whichever succeeded, its values pipe onward
-f.Do(process)
-```
-
-Fallback semantics:
-
-- A fallback receives the previous error if it declares a leading `error` parameter (after an optional `context.Context`): `func(err error)`, `func(ctx context.Context, err error) (string, error)`, ….
-- If a fallback succeeds, the flow recovers and the fallback's return values **replace** the failed action's outputs for piping.
-- If the last fallback also fails, its error is what `Start()` returns.
-- Combine with retry: `.With(retry).OnError(fb)` runs the fallback only after retries are exhausted.
-- Errors don't survive piping (see above) — to forward error details downstream, convert them to a value: `func(err error) (string, string) { return "fallback", err.Error() }`.
-
-To mark an error as non-retryable, wrap it with `flowm.Permanent(err)` (or implement the `DoNotRetry` interface). `RetryPolicy` stops retrying when it sees one — even wrapped, via `errors.As` — and preserves the error for `OnError` or the caller. `errors.Is`/`errors.As` keep working through the wrapper.
-
-### Conditional actions
-
-`When` runs an action only if a predicate accepts the previous action's piped results. Predicates can receive those values directly in their original types:
+`When(predicate, action)` runs **after the action it is attached to**, after all retries and policies have finished. Each predicate receives the completed outcome:
 
 ```go
-f.Do(fetchScore).PipeAll() // fetchScore returns an int
-f.Do(func(score int) int {
-	sendAlert(score)
-	return score
-}).When(func(score int) bool {
-	return score > 90
-}).PipeAll()
-f.Do(logScore) // receives the score whether the alert ran or was skipped
+type Outcome struct {
+	Name     string
+	Values   []interface{} // non-error return values from the final attempt
+	Err      error         // nil on success
+	Attempts int           // calls made to this action, including retries
+}
 ```
 
-- Attach `When` to the action you want to conditionally run. Use `PipeAll`, `Pipe`, or `Map` on the producer to supply values to the predicate and action.
-- A false predicate skips the action, its policies and fallbacks, and its execution hooks. It fires `OnSkip(name)` exactly once. Incoming values remain available to the next action.
-- A true predicate runs the action normally and consumes the incoming values. Return and pipe values again if the following action needs them, as above.
-- The predicate runs once before the action, not on every retry, and must return exactly one boolean. It can accept multiple piped values, such as `func(id int, status string) bool`, and an optional leading `context.Context`.
-- The original `func([]interface{}) bool` form still receives the entire value list (`nil` when nothing was piped). Use `func() bool` for decisions based on captured state; it ignores piped values. A nil predicate leaves the action enabled.
-- A predicate panic or argument mismatch returns a named `ActionError` with zero attempts and emits `OnError`, not `OnSkip`. Predicate failures abort the flow before the action's retry or fallback policies run.
-- `When` applies to top-level actions and entire parallel groups. A group condition can inspect incoming values, but members receive their own explicit parameters. An executed group consumes the incoming values; a skipped group preserves them. Conditions on individual parallel members are rejected by validation.
+Register ordered rules for success and failure:
+
+```go
+f.Do(fetchUser, userID).Named("fetch-user").With(retry).
+	When(func(out flowm.Outcome) bool {
+		return out.Err == nil && out.Values[0].(User).Active
+	}, flowm.Do(func(out flowm.Outcome) error {
+		return sendWelcome(out.Values[0].(User))
+	}).Named("send-welcome")).
+	When(func(out flowm.Outcome) bool {
+		return errors.Is(out.Err, ErrServiceUnavailable)
+	}, flowm.Do(loadCachedUser, userID).Named("load-cache"))
+```
+
+The rules are:
+
+- The source action always runs first. Routing happens once, after its final attempt, regardless of where `When` appears relative to `With(retry)` in the builder chain.
+- Only the **first matching rule** runs. Later predicates and branches are not evaluated.
+- If no rule matches, a successful source continues with its original values; a failed source stops the flow with its original error.
+- The selected branch's values and error replace the source outcome. A successful error branch recovers the flow. A failing branch propagates its own failure; the engine does not try sibling rules afterward.
+- A branch may declare a leading `Outcome` parameter after an optional `context.Context`. These parameters are injected. All other branch arguments are explicit arguments supplied to `Do`; source values are not appended implicitly. Branches that do not request `Outcome` can be ordinary functions with only explicit arguments.
+- Branches have their own names, retry/timeout policies, and nested `When` rules. They use the parent flow context and do not inherit the source action's policies or its expired per-action deadline.
+- `PipeAll`, `Pipe`, and `Map` on the source step apply to the final selected outcome. Branches replace values automatically; piping policies belong on the source step, not on branch actions. A branch returning no values clears the source values.
+- The flow's cancellation stops routing. A timeout on the source action can still be recovered if the parent flow context remains active.
+- Treat outcomes as read-only in predicates. A predicate panic aborts routing, preserves the source failure when present, and is reported as an error for the target branch with zero attempts.
+
+Use nested rules for a recovery chain:
+
+```go
+failed := func(out flowm.Outcome) bool { return out.Err != nil }
+
+cache := flowm.Do(fetchCache).Named("cache").
+	When(failed, flowm.Do(fetchDefault).Named("default"))
+
+f.Do(fetchLive).With(retry).When(failed, cache).PipeAll()
+f.Do(process) // receives live, cached, or default results
+```
+
+Rules work on ordinary actions, members of `AddParallel`, and completed parallel groups. Group outcomes contain the group's returned merged slice as one value in `Outcome.Values`, matching `StartWithResult`. Group routing occurs after the members finish, or after the group's own deadline expires.
+
+`Permanent(err)` and `DoNotRetry` stop retries but remain failures that can be handled by an error-matching rule. To explicitly ignore an error and continue, select a branch that succeeds:
+
+```go
+f.Do(sendNotification).When(
+	func(out flowm.Outcome) bool { return out.Err != nil },
+	flowm.Do(func() {}),
+)
+f.Do(nextTask)
+```
+
+An empty recovery branch clears the source's returned values. If the next task needs values from the failed action, have the branch receive `Outcome` and return the specific values to keep. An unmatched error still stops the flow; a selected branch's failure requires its own nested recovery rule.
 
 ### Retries
 
@@ -263,7 +281,7 @@ f.Do(slowCall).With(&flowm.TimeoutPolicy{
 })
 ```
 
-The attempt deadline is injected into context-aware functions and pre-execution policies. On expiry an attempt fails with `context.DeadlineExceeded`. `Overall` covers attempts, rate-limit waits, and retry delays; exhaustion stops further attempts. Fallbacks use the parent flow context so they can still recover from an action timeout.
+The attempt deadline is injected into context-aware functions and pre-execution policies. On expiry an attempt fails with `context.DeadlineExceeded`. `Overall` covers attempts, rate-limit waits, and retry delays; exhaustion stops further attempts. Selected branches use the parent flow context so they can still recover from an action timeout.
 
 > Note: the underlying goroutine is not forcibly stopped — pass a context and honor it in your function for cooperative cancellation.
 
@@ -305,13 +323,16 @@ f.Do(callB).With(rl)
 f.AddParallel(
 	flowm.Do(fetchName).Named("name"),
 	flowm.Do(fetchRole).Named("role").With(rateLimiter),
-	flowm.Do(fetchTeam, teamID).Named("team").OnError(fetchTeamFromCache),
+	flowm.Do(fetchTeam, teamID).Named("team").When(
+		func(out flowm.Outcome) bool { return out.Err != nil },
+		flowm.Do(fetchTeamFromCache, teamID),
+	),
 ).Named("fetch-details").WithConcurrency(2).PipeAll()
 f.Do(func(name, role, team string) { ... })
 ```
 
 - Results are flattened in **declaration order** (not completion order) and can be piped.
-- Per-action policies — including `OnError` fallbacks — apply inside the group.
+- Each member runs its own policies and outcome routes inside its worker slot.
 - `WithConcurrency(n)` sets a positive limit on the group. It creates at most `n` workers and limits the number of active member executions. Without a limit, all members may run concurrently. Timed-out functions must honor their contexts to stop their underlying work.
 - Legacy `WorkerPoolPolicy` values on members still work, but a group limit takes precedence. Conflicting member limits without a group limit fail validation; placing the limit on the group is preferred.
 - Cancellation prevents queued members from starting. Empty groups succeed with no member results.
@@ -329,7 +350,7 @@ f := flowm.New().WithHooks(flowm.Hooks{
 })
 ```
 
-Hooks use the explicit action name when provided, otherwise the function name. `OnSkip` fires only when a `When` predicate returns false; skipped actions do not emit `OnStart`, `OnSuccess`, `OnError`, or `OnRetry`. Actions never reached because of an earlier failure do not emit `OnSkip`. Validation failures occur before execution hooks run. Execution-time `OnError` receives the structured `ActionError`.
+Hooks use the explicit action name when provided, otherwise the function name. Each source emits its success or error hook before routing; a selected branch emits its own hooks. A recovered source failure therefore remains observable. `OnSkip` names the branch whose predicate returned false. Rules after the first match are not evaluated and emit no hooks. Preflight failures occur before execution hooks run. Error hooks receive structured `ActionError` values. `Hooks.OnError` remains an observation callback; the old `OnError` recovery method has been removed.
 
 Hooks cannot change outcomes — use policies for that. Hooks invoked by parallel members must be safe for concurrent calls. Use `StartWithResult()` to retrieve the final result directly.
 
@@ -375,7 +396,6 @@ Optional capability interfaces — implement any of these and the flow wires the
 | `ContextAwarePolicy` | receive the flow's context | retry |
 | `RetryHookAwarePolicy` | receive the `OnRetry` hook | retry |
 | `ExecutorAwarePolicy` | re-run the action through the full execution path | retry |
-| `FallbackAwarePolicy` | invoke alternative functions and replace the piped result | fallback |
 | `AttemptObserverPolicy` | observe the outcome of every executed attempt | circuit breaker |
 
 ## API reference
@@ -393,9 +413,7 @@ type Flowm interface {
 	PipeAll() Flowm
 	Pipe(indices ...int) Flowm
 	Map(mapper func([]interface{}) []interface{}) Flowm
-	ContinueOnError() Flowm
-	OnError(function interface{}, params ...interface{}) Flowm
-	When(predicate interface{}) Flowm
+	When(predicate func(Outcome) bool, action Action) Flowm
 	WithConcurrency(limit int) Flowm // last added parallel group
 
 	// configuring the flow
@@ -409,7 +427,7 @@ type Flowm interface {
 }
 
 // Action builders
-func Do(function interface{}, params ...interface{}) Action // chainable: .Named, .With, .OnError
+func Do(function interface{}, params ...interface{}) Action // chainable: .Named, .With, .When
 
 // Errors
 func Permanent(err error) error // mark non-retryable; unwrappable via errors.Is/As
@@ -428,19 +446,16 @@ Built-in policies:
 | `TimeoutPolicy{PerAttempt, Overall}` | bound each attempt and the total action budget |
 | `CircuitBreakerPolicy{Failures, Window, Cooldown}` | fail fast after repeated failures |
 | `RateLimitPolicy{Per, Burst}` | token-bucket throttling |
-| `FallbackPolicy{Func, Params}` | run an alternative function on failure (sugar: `OnError`) |
-| `ContinueOnErrorPolicy{Continue: true}` | swallow errors, keep the flow going (sugar: `ContinueOnError`) |
-| `ConditionPolicy{If}` | run a top-level action only when its predicate accepts the incoming values (sugar: `When`) |
 | `WorkerPoolPolicy{Size}` | group concurrency limit (sugar: `WithConcurrency`); member placement is deprecated |
 | `PipeAllPolicy` / `PipeIndicesPolicy` / `PipeMapPolicy` | piping (sugar: `PipeAll` / `Pipe` / `Map`) |
 
 ## Behavior notes
 
-- **Policy order matters.** Policies run in attachment order: `.With(retry).OnError(fb)` retries first and falls back only when retries are exhausted; reversed, the fallback would run before the retry sees the error.
-- **Shared policy instances share state.** One `RateLimitPolicy` across actions = one global bucket; one `CircuitBreakerPolicy` = one shared breaker. Use separate instances for independent behavior. Built-in retry and fallback configuration is copied per invocation. Custom policies and hooks used by parallel members must be safe for concurrent calls.
+- **Policy order matters within an action.** Policies run in attachment order. Outcome routing always runs afterward, with the first matching `When` winning.
+- **Shared policy instances share state.** One `RateLimitPolicy` across actions = one global bucket; one `CircuitBreakerPolicy` = one shared breaker. Use separate instances for independent behavior. Built-in retry configuration is copied per invocation. Route definitions can be reused; branch execution has independent invocation state. Custom policies and hooks used by parallel members must be safe for concurrent calls.
 - **Reflection trade-off.** Definitions and explicit arguments are validated before execution; dynamic piped arguments are validated when available. Nil is accepted for nil-capable parameters, and variadic functions accept individual arguments. This does not provide compile-time checking.
-- **Panics become errors.** A panic in an action or fallback is recovered and treated as a normal error — it can be retried, caught by `OnError`, or continued past.
-- **Non-retryable errors remain errors.** `Permanent` and `DoNotRetry` stop retries; handle the error with `OnError`, explicitly ignore it with `ContinueOnError`, or let `Start()` return it.
+- **Panics become errors.** A panic in an action or branch is recovered and treated as an error that can be retried or handled by a route. A predicate panic terminates routing.
+- **Non-retryable errors remain errors.** `Permanent` and `DoNotRetry` stop retries; handle or explicitly ignore the error with an error-matching `When`, or let `Start()` return it.
 - **Results come from `StartWithResult`, piping, or hooks.** `Start()` returns only `error`; use `StartWithResult()`, pipe into a consumer function, or the `OnSuccess` hook.
 
 ## Migration from the previous API
@@ -453,15 +468,27 @@ This cleanup intentionally breaks compatibility with the removed APIs. The packa
 | `ForEach` / `ForEachPolicy` | Implicit concurrent fan-out reused mutable policy instances. Use a loop or build explicit `Action` values for `AddParallel`. |
 | `DoFlow` | Mutated the child flow's context. Compose ordinary functions, or use `Do(sub.StartWithResult)` with the child's context configured explicitly. |
 | `NewAction(fn, params, policies...)` | Duplicate constructor. Use `Do(fn, params...).With(policies...)`. |
-| `TerminatePolicy` | Its name suggested stopping, but it continued after errors. Use `ContinueOnError()`. |
+| `TerminatePolicy` | Its name suggested stopping, but it continued after errors. Use an error-matching `When` with a successful recovery branch. |
 | `PassValuesPolicy` | Deprecated duplicate. Use `PipeAll()` or `PipeAllPolicy`. |
 | `RetryPolicy.Fn` | Duplicate retry gate. Use `RetryIf`; use a `PreExecutionPolicy` for checks before every attempt. |
 | `RetryPolicy.MaxElapsed` | Overlapping budget that did not cover the initial attempt or bound waits. Use `TimeoutPolicy.Overall` or a context deadline. |
 | `MultiError` | Duplicated the standard library. Parallel failures now use `errors.Join`; inspect them with `errors.Is` / `errors.As` instead of asserting a concrete container type or matching its text. |
 
-`Permanent` / `DoNotRetry` now preserve the failure instead of silently succeeding. `RetryIf` and `Delay` now apply before the first retry as well as later retries. Parallel members also honor `ContinueOnErrorPolicy`, and piped parallel results exclude error values.
+`Permanent` / `DoNotRetry` now preserve the failure instead of silently succeeding. `RetryIf` and `Delay` now apply before the first retry as well as later retries. Parallel members support recovery through `When`, and piped parallel results exclude error values.
 
-The newer functionality adds `Named`, `Validate`, `WithConcurrency`, `ActionError`, and `Hooks.OnSkip`. Existing slice-based `When` calls continue to work, but custom implementations of `Flowm` must add the new methods and change their `When` signature to accept `interface{}`. Use keyed `Action` literals when constructing actions directly. `Start` now rejects invalid definitions before any action runs, and returned error text includes action names and attempt counts; inspect causes with `errors.Is`/`errors.As` instead of equality or string matching.
+The outcome-routing API intentionally replaces the previous conditional and fallback APIs:
+
+| Previous API | Replacement |
+|---|---|
+| `f.Do(consumer).When(predicate)` | Attach `When(func(Outcome) bool, Do(consumer...))` to the **producer**. Adapt the branch to request `Outcome` if it needs the producer's values. |
+| `OnError(fn, params...)` / `Action.OnError` | `When(func(out Outcome) bool { return out.Err != nil }, Do(fn, params...))`; use an `Outcome` parameter instead of an injected `error`. |
+| `ContinueOnError()` / `ContinueOnErrorPolicy` | Use an error-matching `When` with a successful branch, such as `Do(func() {})`. An empty branch clears source values; explicitly return any values the next task needs. |
+| Chained `OnError` calls | Nested `When` rules on branch actions. Sibling rules are first-match alternatives. |
+| `ConditionPolicy`, `FallbackPolicy`, `FallbackAwarePolicy` | Removed. Attach routes with `When`; a branch is an ordinary `Action` with its own policies. |
+| Single-argument or slice-based `When` predicates | Use `func(Outcome) bool` and inspect `out.Values` and `out.Err`. Nil predicates are invalid. |
+| `OnSkip` for the source action | `OnSkip` now reports a branch whose rule was evaluated and did not match. The source action always executes. |
+
+Custom `Flowm` implementations must use the new `When` signature; `OnError` and `ContinueOnError` are no longer required interface methods. `Hooks.OnError` remains available for observation. Use keyed `Action` literals. `Start` validates all branch definitions before execution, and returned error text includes action details; inspect causes with `errors.Is`/`errors.As` instead of equality or string matching.
 
 ## Testing
 

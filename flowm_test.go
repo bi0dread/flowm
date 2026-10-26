@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -214,8 +213,8 @@ func TestFlowm_CircuitBreaker_Open(t *testing.T) {
 		return errors.New("fail")
 	}
 	f := New()
-	f.AddAction(Do(bad).With(cb, &ContinueOnErrorPolicy{Continue: true}))
-	f.AddAction(Do(bad).With(cb, &ContinueOnErrorPolicy{Continue: true}))
+	f.AddAction(Do(bad).With(cb).When(failed, Do(func() {})))
+	f.AddAction(Do(bad).With(cb).When(failed, Do(func() {})))
 	f.AddAction(Do(bad).With(cb))
 	err := f.Start()
 	if err == nil {
@@ -349,115 +348,6 @@ func TestFlowm_RetryPolicy_PipesResultFromSuccessfulRetry(t *testing.T) {
 	}
 }
 
-func TestFlowm_OnError_RecoversAndContinues(t *testing.T) {
-	f := New()
-	var recovered, ran bool
-	primary := func() error { return errors.New("primary down") }
-	fallback := func(err error) { recovered = err.Error() == "primary down" }
-	f.Do(primary).OnError(fallback)
-	f.Do(func() { ran = true })
-	if err := f.Start(); err != nil {
-		t.Fatalf("expected fallback to recover the flow, got %v", err)
-	}
-	if !recovered {
-		t.Fatal("expected fallback to receive the primary error")
-	}
-	if !ran {
-		t.Fatal("expected next action to run after recovery")
-	}
-}
-
-func TestFlowm_OnError_ContextAndErrorInjection(t *testing.T) {
-	type ctxKey struct{}
-	ctx := context.WithValue(context.Background(), ctxKey{}, "ctx-ok")
-	f := New().WithContext(ctx)
-	var gotCtx, gotErr string
-	fallback := func(c context.Context, err error) {
-		gotCtx, _ = c.Value(ctxKey{}).(string)
-		gotErr = err.Error()
-	}
-	f.Do(func() error { return errors.New("boom") }).OnError(fallback)
-	if err := f.Start(); err != nil {
-		t.Fatal(err)
-	}
-	if gotCtx != "ctx-ok" {
-		t.Fatalf("expected context injection into fallback, got %q", gotCtx)
-	}
-	if gotErr != "boom" {
-		t.Fatalf("expected error injection into fallback, got %q", gotErr)
-	}
-}
-
-func TestFlowm_OnError_FallbackResultsArePiped(t *testing.T) {
-	f := New()
-	primary := func() (string, error) { return "", errors.New("no data") }
-	fallback := func(err error) (string, error) { return "cached-value", nil }
-	var got string
-	consume := func(dst *string, s string) { *dst = s }
-	f.Do(primary).OnError(fallback).PipeAll()
-	f.AddAction(Do(consume, &got))
-	if err := f.Start(); err != nil {
-		t.Fatal(err)
-	}
-	if got != "cached-value" {
-		t.Fatalf("expected fallback value to be piped, got %q", got)
-	}
-}
-
-func TestFlowm_OnError_ChainedFallbacks(t *testing.T) {
-	f := New()
-	primary := func() error { return errors.New("primary down") }
-	fb1 := func(err error) error { return errors.New("fallback1 down") }
-	var got string
-	fb2 := func(err error) { got = err.Error() }
-	f.Do(primary).OnError(fb1).OnError(fb2)
-	if err := f.Start(); err != nil {
-		t.Fatal(err)
-	}
-	if got != "fallback1 down" {
-		t.Fatalf("expected second fallback to receive first fallback's error, got %q", got)
-	}
-}
-
-func TestFlowm_OnError_AfterRetryExhausted(t *testing.T) {
-	calls := 0
-	primary := func() error { calls++; return errors.New("down") }
-	var recovered bool
-	retry := &RetryPolicy{Attempts: 3, Delay: time.Millisecond}
-	f := New()
-	f.Do(primary).With(retry).OnError(func(err error) { recovered = true })
-	if err := f.Start(); err != nil {
-		t.Fatal(err)
-	}
-	if calls != 3 {
-		t.Fatalf("expected fallback only after 3 attempts, got %d", calls)
-	}
-	if !recovered {
-		t.Fatal("expected fallback to run after retries were exhausted")
-	}
-}
-
-func TestFlowm_OnError_FallbackFailurePropagates(t *testing.T) {
-	failure := errors.New("fallback down")
-	f := New()
-	f.Do(func() error { return errors.New("primary down") }).
-		OnError(func(err error) error { return failure })
-	err := f.Start()
-	if !errors.Is(err, failure) {
-		t.Fatalf("expected fallback error, got %v", err)
-	}
-}
-
-func TestFlowm_OnError_FallbackPanicBecomesError(t *testing.T) {
-	f := New()
-	f.Do(func() error { return errors.New("x") }).
-		OnError(func(err error) { panic("fallback exploded") })
-	err := f.Start()
-	if err == nil || !strings.Contains(err.Error(), "fallback exploded") {
-		t.Fatalf("expected recovered panic error, got %v", err)
-	}
-}
-
 func TestFlowm_DoStyleAction_InParallel(t *testing.T) {
 	f := New()
 	fa := func() string { return "A" }
@@ -477,18 +367,18 @@ func TestFlowm_DoStyleAction_InParallel(t *testing.T) {
 	}
 }
 
-func TestFlowm_DoStyleAction_PoliciesAndFallback(t *testing.T) {
+func TestFlowm_DoStyleAction_PoliciesAndRouting(t *testing.T) {
 	f := New()
 	good := func() string { return "A" }
 	bad := func() (string, error) { return "", errors.New("b down") }
-	fallback := func(err error) (string, error) { return "B-fallback", nil }
+	fallback := func() (string, error) { return "B-fallback", nil }
 	rc := &retryCounter{}
 	retry := &RetryPolicy{Attempts: 3, Delay: time.Millisecond}
 	var got []string
 	collect := func(dst *[]string, a, b string) { *dst = append(*dst, a, b) }
 	f.AddParallel(
 		Do(good),
-		Do(bad).OnError(fallback),
+		Do(bad).When(failed, Do(fallback)),
 	).PipeAll()
 	f.AddAction(Do(collect, &got))
 	f.Do(rc.failUntil, 2).With(retry) // chained policy on the flow builder still works
@@ -504,7 +394,7 @@ func TestFlowm_DoStyleAction_PoliciesAndFallback(t *testing.T) {
 }
 
 func TestFlowm_DoStyleAction_WithDoesNotShareBackingArray(t *testing.T) {
-	base := Do(func() {}).With(&ContinueOnErrorPolicy{Continue: true})
+	base := Do(func() {}).With(&RetryPolicy{Attempts: 2})
 	a := base.With(&PipeAllPolicy{})
 	b := base.With(&TimeoutPolicy{PerAttempt: time.Second})
 	if len(a.Policies) != 2 || len(b.Policies) != 2 {
@@ -613,12 +503,12 @@ func TestFlowm_CircuitBreaker_CountsRetryAttempts(t *testing.T) {
 	}
 }
 
-func TestFlowm_ContinueOnError_Continues(t *testing.T) {
+func TestFlowm_WhenEmptyRecovery_ClearsValuesAndContinues(t *testing.T) {
 	f := New()
 	var ran bool
-	bad := func() error { return errors.New("x") }
+	bad := func() (int, error) { return 7, errors.New("x") }
 	good := func() { ran = true }
-	f.AddAction(Do(bad).With(&ContinueOnErrorPolicy{Continue: true}))
+	f.Do(bad).When(failed, Do(func() {})).PipeAll()
 	f.AddAction(Do(good))
 	if err := f.Start(); err != nil {
 		t.Fatal(err)

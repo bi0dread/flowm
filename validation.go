@@ -11,13 +11,12 @@ import (
 var (
 	contextType = reflect.TypeOf((*context.Context)(nil)).Elem()
 	errorType   = reflect.TypeOf((*error)(nil)).Elem()
-	valuesType  = reflect.TypeOf([]interface{}{})
 )
 
 // Validate checks all action definitions, explicit arguments, built-in policy
-// settings, predicates, fallbacks, and parallel members without invoking them.
-// Piped arguments are checked at runtime, since maps, fallbacks, and skipped
-// actions can change their types and counts. Start calls Validate automatically.
+// settings, routes, and parallel members without invoking them. Piped arguments
+// are checked at runtime, since maps and routes can change their types and
+// counts. Start calls Validate automatically.
 func (f *flowm) Validate() error {
 	var errs []error
 	mayReceiveValues := false
@@ -25,7 +24,7 @@ func (f *flowm) Validate() error {
 		if err := validateAction(st.Action, mayReceiveValues, false); err != nil {
 			errs = append(errs, err)
 		}
-		mayReceiveValues = hasPiping(st.Action) || (conditionPolicyOf(st.Action) != nil && mayReceiveValues)
+		mayReceiveValues = hasPiping(st.Action)
 	}
 	return errors.Join(errs...)
 }
@@ -61,7 +60,7 @@ func validateAction(action Action, mayReceiveValues, parallelMember bool) (err e
 			return err
 		}
 	}
-	seenCondition, seenTimeout, seenLimit := false, false, false
+	seenTimeout, seenLimit := false, false
 	for _, policy := range action.Policies {
 		if policy == nil || nilValue(reflect.ValueOf(policy)) {
 			return errors.New("policy must not be nil")
@@ -95,28 +94,6 @@ func validateAction(action Action, mayReceiveValues, parallelMember bool) (err e
 				return errors.New("concurrency limits require a parallel group")
 			}
 			seenLimit = true
-		case *ConditionPolicy:
-			if parallelMember || seenCondition {
-				return errors.New("use one When predicate on a top-level action or parallel group")
-			}
-			seenCondition = true
-			if err := validatePredicate(p.If); err != nil {
-				return err
-			}
-			if !mayReceiveValues && !disabledPredicate(p.If) {
-				if _, err := prepareArguments(p.If, predicateArguments(p.If, nil), context.Background(), false); err != nil {
-					return fmt.Errorf("When predicate: %w", err)
-				}
-			}
-		case *FallbackPolicy:
-			fnType, err := functionType(p.Func)
-			if err != nil {
-				return fmt.Errorf("fallback: %w", err)
-			}
-			params := injectFallbackError(fnType, p.Params, errors.New("validation"))
-			if _, err := prepareArguments(p.Func, params, context.Background(), false); err != nil {
-				return fmt.Errorf("fallback: %w", err)
-			}
 		case *PipeIndicesPolicy:
 			for _, index := range p.Indices {
 				if index < 0 {
@@ -127,6 +104,17 @@ func validateAction(action Action, mayReceiveValues, parallelMember bool) (err e
 			if p.Mapper == nil {
 				return errors.New("pipe mapper must not be nil")
 			}
+		}
+	}
+	for _, rule := range action.routes {
+		if rule.predicate == nil {
+			return fmt.Errorf("When branch %q requires a non-nil predicate", actionName(rule.action))
+		}
+		if hasPiping(rule.action) {
+			return fmt.Errorf("put piping on the source step, not When branch %q", actionName(rule.action))
+		}
+		if err := validateAction(bindOutcome(rule.action, Outcome{}), false, false); err != nil {
+			return fmt.Errorf("When branch: %w", err)
 		}
 	}
 	if action.parallel != nil {

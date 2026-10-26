@@ -18,6 +18,7 @@ type Action struct {
 	Params   []interface{}
 	Policies []Policy
 	parallel *parallelGroup
+	routes   []route
 }
 
 type stub struct {
@@ -35,9 +36,7 @@ type Flowm interface {
 	PipeAll() Flowm
 	Pipe(indices ...int) Flowm
 	Map(mapper func([]interface{}) []interface{}) Flowm
-	ContinueOnError() Flowm
-	OnError(function interface{}, params ...interface{}) Flowm
-	When(predicate interface{}) Flowm
+	When(predicate func(Outcome) bool, action Action) Flowm
 	AddParallel(actions ...Action) Flowm
 	WithConcurrency(limit int) Flowm
 	Validate() error
@@ -89,22 +88,6 @@ func (f *flowm) StartWithResult() ([]interface{}, error) {
 			}
 			return nil, failure
 		}
-		if condition := conditionPolicyOf(st.Action); condition != nil {
-			run, err := f.evaluateCondition(condition.If, pipedValues)
-			if err != nil {
-				failure := &ActionError{Name: st.Name, Err: err}
-				if f.hooks != nil && f.hooks.OnError != nil {
-					f.hooks.OnError(st.Name, failure)
-				}
-				return nil, failure
-			}
-			if !run {
-				if f.hooks != nil && f.hooks.OnSkip != nil {
-					f.hooks.OnSkip(st.Name)
-				}
-				continue
-			}
-		}
 		if hasPiped {
 			if st.Action.parallel == nil {
 				params := make([]interface{}, 0, len(st.Action.Params)+len(pipedValues))
@@ -114,30 +97,17 @@ func (f *flowm) StartWithResult() ([]interface{}, error) {
 			hasPiped = false
 			pipedValues = nil
 		}
-		result, err, pipeNext, pipeVals, continueOnErr := f.runSingleAction(st)
+		result, err, pipeNext, pipeVals := f.runSingleAction(st)
 		lastResult = result
 		if pipeNext {
 			pipedValues = pipeVals
 			hasPiped = true
 		}
 		if err != nil {
-			if continueOnErr {
-				// swallow error and continue
-				continue
-			}
 			return nil, err
 		}
 	}
 	return filterErrorValues(lastResult), nil
-}
-
-func conditionPolicyOf(action Action) *ConditionPolicy {
-	for _, policy := range action.Policies {
-		if condition, ok := policy.(*ConditionPolicy); ok {
-			return condition
-		}
-	}
-	return nil
 }
 
 // filterErrorValues drops error-typed values from a result set.
@@ -153,7 +123,7 @@ func filterErrorValues(vals []interface{}) []interface{} {
 }
 
 // Do builds an Action with the same signature as Flowm.Do; attach policies by
-// chaining, e.g. flowm.Do(fn, arg).With(retry).OnError(fallback). Intended for
+// chaining With, Named, and When. Intended for
 // AddParallel and anywhere an Action value is needed.
 func Do(function interface{}, params ...interface{}) Action {
 	return Action{Func: function, Params: params}
@@ -175,9 +145,13 @@ func (a Action) With(policies ...Policy) Action {
 	return a
 }
 
-// OnError attaches a fallback function to the action, like Flowm.OnError.
-func (a Action) OnError(function interface{}, params ...interface{}) Action {
-	return a.With(&FallbackPolicy{Func: function, Params: params})
+// When appends an ordered outcome rule and its branch action.
+// Only the first matching rule runs; the branch replaces this action's outcome.
+func (a Action) When(predicate func(Outcome) bool, branch Action) Action {
+	rules := make([]route, 0, len(a.routes)+1)
+	rules = append(rules, a.routes...)
+	a.routes = append(rules, route{predicate: predicate, action: branch})
+	return a
 }
 
 func (f *flowm) callFunc(function interface{}, params ...interface{}) ([]interface{}, error) {
@@ -214,20 +188,12 @@ func callValues(function interface{}, args []reflect.Value) ([]interface{}, erro
 	return result, errors.Join(errs...)
 }
 
-func (f *flowm) runSingleAction(st stub) (result []interface{}, err error, pipeNext bool, pipeVals []interface{}, continueOnErr bool) {
-	attempts := 0
+// executeAction completes the primary call and its policies before routing.
+func (f *flowm) executeAction(st stub) (result []interface{}, err error, attempts int) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			result, pipeNext, pipeVals = nil, false, nil
+			result = nil
 			err = fmt.Errorf("panic: %v", recovered)
-		}
-		if err != nil {
-			err = &ActionError{Name: st.Name, Attempts: attempts, Err: err}
-			if f.hooks != nil && f.hooks.OnError != nil {
-				f.hooks.OnError(st.Name, err)
-			}
-		} else if f.hooks != nil && f.hooks.OnSuccess != nil {
-			f.hooks.OnSuccess(st.Name, result)
 		}
 	}()
 	if st.Action.parallel != nil {
@@ -251,9 +217,6 @@ func (f *flowm) runSingleAction(st stub) (result []interface{}, err error, pipeN
 	for i, p := range st.Action.Policies {
 		switch p := p.(type) {
 		case *RetryPolicy:
-			local := *p
-			st.Action.Policies[i] = &local
-		case *FallbackPolicy:
 			local := *p
 			st.Action.Policies[i] = &local
 		}
@@ -284,10 +247,6 @@ func (f *flowm) runSingleAction(st stub) (result []interface{}, err error, pipeN
 				}
 			}
 			rh.SetOnRetry(onRetry)
-		}
-		if fa, ok := p.(FallbackAwarePolicy); ok {
-			fa.SetFlowCaller(f.callFunc)
-			fa.SetResultSink(func(res []interface{}) { result = res })
 		}
 	}
 	// executeOnce runs one full attempt: pre-execution checks (rate limit,
@@ -342,10 +301,8 @@ func (f *flowm) runSingleAction(st stub) (result []interface{}, err error, pipeN
 		if ea, ok := p.(ExecutorAwarePolicy); ok {
 			ea.SetExecutor(func() ([]interface{}, error) {
 				res, execErr := executeOnce()
-				if execErr == nil {
-					// a successful retry replaces the piped result
-					result = res
-				}
+				// Routing sees the final attempt's values even when it fails.
+				result = res
 				return res, execErr
 			})
 		}
@@ -355,12 +312,25 @@ func (f *flowm) runSingleAction(st stub) (result []interface{}, err error, pipeN
 	}
 	result, err = executeOnce()
 	for _, policy := range st.Action.Policies {
-		if c, ok := policy.(*ContinueOnErrorPolicy); ok && c.Continue {
-			continueOnErr = true
-		}
 		err = policy.Do(st.Action, err)
 	}
-	if len(result) > 0 {
+	return
+}
+
+// Piping on the originating flow step applies to the selected branch's values.
+func (f *flowm) runSingleAction(st stub) (result []interface{}, err error, pipeNext bool, pipeVals []interface{}) {
+	outcome := f.runAction(st)
+	result, err = outcome.Values, outcome.failure()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			result, pipeNext, pipeVals = nil, false, nil
+			err = &ActionError{Name: st.Name, Err: fmt.Errorf("pipe panic: %v", recovered)}
+			if f.hooks != nil && f.hooks.OnError != nil {
+				f.hooks.OnError(st.Name, err)
+			}
+		}
+	}()
+	if err == nil && len(result) > 0 {
 		// prepare values for piping: drop error-typed returns and expand nested []interface{}
 		filtered := filterErrorValues(result)
 		// helper to set pipe all semantics
@@ -443,14 +413,6 @@ type ExecutorAwarePolicy interface {
 	SetExecutor(fn func() ([]interface{}, error))
 }
 
-// FallbackAwarePolicy lets a policy invoke alternative functions through the
-// flow's calling machinery (context injection) and replace the action's piped
-// result when it recovers from an error.
-type FallbackAwarePolicy interface {
-	SetFlowCaller(call func(fn interface{}, params ...interface{}) ([]interface{}, error))
-	SetResultSink(sink func([]interface{}))
-}
-
 // AttemptObserverPolicy is notified after every executed attempt (the initial
 // call and each retry) with the attempt's error, nil on success. Attempts
 // rejected by a pre-execution policy are not reported.
@@ -468,94 +430,6 @@ type RetryPolicy struct {
 	ctx           context.Context
 	onRetry       func(actionName string, attempt int, err error)
 	execute       func() ([]interface{}, error)
-}
-
-type ContinueOnErrorPolicy struct{ Continue bool }
-
-func (c *ContinueOnErrorPolicy) Do(action Action, mainErr error) error { return mainErr }
-
-// ConditionPolicy gates a top-level flow action using its incoming piped values.
-// If accepts a typed predicate such as func(Order) bool, or the legacy
-// func([]interface{}) bool form. Predicates must return exactly one boolean.
-// A false predicate skips the action without consuming those values.
-// A nil predicate allows the action to run. Sugar: Flowm.When.
-type ConditionPolicy struct {
-	If interface{}
-}
-
-func (c *ConditionPolicy) Do(action Action, mainErr error) error { return mainErr }
-
-// FallbackPolicy runs an alternative function when the action fails. If the
-// fallback succeeds, the error is swallowed and the fallback's return values
-// replace the action's outputs for piping. The action's error is passed to
-// the fallback if it declares a leading error parameter (after an optional
-// context.Context). Chain multiple fallbacks: the next one runs only if the
-// previous fallback also failed.
-type FallbackPolicy struct {
-	Func   interface{}
-	Params []interface{}
-	caller func(fn interface{}, params ...interface{}) ([]interface{}, error)
-	sink   func([]interface{})
-}
-
-func (p *FallbackPolicy) SetFlowCaller(call func(fn interface{}, params ...interface{}) ([]interface{}, error)) {
-	p.caller = call
-}
-
-func (p *FallbackPolicy) SetResultSink(sink func([]interface{})) { p.sink = sink }
-
-func (p *FallbackPolicy) Do(action Action, mainErr error) (err error) {
-	if mainErr == nil || p.Func == nil {
-		return mainErr
-	}
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("panic: %v", r)
-		}
-	}()
-	params := p.Params
-	if fnType := reflect.TypeOf(p.Func); fnType != nil && fnType.Kind() == reflect.Func {
-		params = injectFallbackError(fnType, params, mainErr)
-	}
-	call := p.caller
-	if call == nil {
-		// standalone use outside a flow: no caller injected
-		call = func(fn interface{}, ps ...interface{}) ([]interface{}, error) { return callReflect(fn, ps...) }
-	}
-	res, ferr := call(p.Func, params...)
-	if ferr != nil {
-		return ferr
-	}
-	if p.sink != nil {
-		p.sink(res)
-	}
-	return nil
-}
-
-// injectFallbackError inserts the failure after an optional explicit context.
-func injectFallbackError(fnType reflect.Type, params []interface{}, mainErr error) []interface{} {
-	position, argument := 0, 0
-	if fnType.NumIn() > 0 && fnType.In(0) == contextType {
-		position = 1
-		if explicitContext(params) && (fnType.IsVariadic() || len(params) >= fnType.NumIn()-1) {
-			argument = 1
-		}
-	}
-	if fnType.NumIn() <= position || fnType.In(position) != errorType {
-		return params
-	}
-	inject := len(params) == fnType.NumIn()-position+argument-1
-	if fnType.IsVariadic() {
-		inject = len(params) <= argument || params[argument] == nil || !reflect.TypeOf(params[argument]).AssignableTo(errorType)
-	}
-	if inject {
-		injected := make([]interface{}, 0, len(params)+1)
-		injected = append(injected, params[:argument]...)
-		injected = append(injected, mainErr)
-		injected = append(injected, params[argument:]...)
-		return injected
-	}
-	return params
 }
 
 type PipeAllPolicy struct{}
@@ -816,21 +690,14 @@ func (f *flowm) Map(mapper func([]interface{}) []interface{}) Flowm {
 	return f.With(&PipeMapPolicy{Mapper: mapper})
 }
 
-func (f *flowm) ContinueOnError() Flowm { return f.With(&ContinueOnErrorPolicy{Continue: true}) }
-
-// OnError attaches a fallback function to the last added action: it runs when
-// the action fails, and if it succeeds the flow continues with its return
-// values as the piped outputs.
-func (f *flowm) OnError(function interface{}, params ...interface{}) Flowm {
-	return f.With(&FallbackPolicy{Func: function, Params: params})
-}
-
-// When runs the last added action only if predicate accepts its piped values.
-// It accepts typed predicates such as func(Order) bool and the original
-// func([]interface{}) bool form. A zero-argument predicate can use captured
-// state. Skipping leaves values available for the next action and emits OnSkip.
-func (f *flowm) When(predicate interface{}) Flowm {
-	return f.With(&ConditionPolicy{If: predicate})
+// When appends a rule to the last added action. Rules run after its final
+// attempt and policies, in registration order, until the first match.
+func (f *flowm) When(predicate func(Outcome) bool, branch Action) Flowm {
+	if f.lastIndex >= 0 {
+		st := &f.stubStorage[f.lastIndex]
+		st.Action = st.Action.When(predicate, branch)
+	}
+	return f
 }
 
 func (f *flowm) AddParallel(actions ...Action) Flowm {

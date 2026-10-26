@@ -68,10 +68,7 @@ func (f *flowm) runParallel(ctx context.Context, actions []Action, limit int) ([
 					out[i].err = &ActionError{Name: name, Err: err}
 					continue
 				}
-				values, err, _, _, continueOnErr := group.runSingleAction(stub{Name: name, Action: actions[i]})
-				if continueOnErr {
-					err = nil
-				}
+				values, err, _, _ := group.runSingleAction(stub{Name: name, Action: actions[i]})
 				out[i] = outcome{values: values, err: err}
 			}
 		}()

@@ -7,13 +7,18 @@ import (
 	"github.com/bi0dread/flowm"
 )
 
-func Example_typedWhen() {
+func Example_outcomeRouting() {
 	f := flowm.New().WithHooks(flowm.Hooks{
 		OnSkip: func(name string) { fmt.Println("skipped:", name) },
 	})
-	f.Do(func() int { return 50 }).PipeAll()
-	f.Do(func(score int) { fmt.Println("alert:", score) }).
-		Named("high-score-alert").When(func(score int) bool { return score > 90 })
+	f.Do(func() int { return 50 }).Named("fetch-score").When(
+		func(out flowm.Outcome) bool { return out.Err == nil && out.Values[0].(int) > 90 },
+		flowm.Do(func(out flowm.Outcome) int {
+			score := out.Values[0].(int)
+			fmt.Println("alert:", score)
+			return score
+		}).Named("high-score-alert"),
+	).PipeAll()
 	f.Do(func(score int) { fmt.Println("score:", score) })
 	if err := f.Start(); err != nil {
 		panic(err)

@@ -5,7 +5,7 @@ import "fmt"
 // ActionError identifies a failed action while preserving its underlying error.
 // Attempts counts actual calls to the primary function, including retries. It is
 // zero for validation failures, predicate failures, and rejected execution.
-// Fallback calls do not increase this count.
+// A selected branch has its own name and attempt count.
 type ActionError struct {
 	Name     string
 	Attempts int

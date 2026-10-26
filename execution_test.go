@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-func TestFlowm_PermanentError_ReachesFallback(t *testing.T) {
+func TestFlowm_PermanentError_ReachesRoute(t *testing.T) {
 	for _, permanentAt := range []int{1, 2} {
 		t.Run(fmt.Sprint(permanentAt), func(t *testing.T) {
 			failure := errors.New("permanent failure")
@@ -22,12 +22,12 @@ func TestFlowm_PermanentError_ReachesFallback(t *testing.T) {
 					return fmt.Errorf("wrapped: %w", Permanent(failure))
 				}
 				return errors.New("transient")
-			}).With(&RetryPolicy{Attempts: 5}).OnError(func(err error) (string, error) {
-				if !errors.Is(err, failure) {
-					return "", fmt.Errorf("unexpected fallback error: %w", err)
+			}).With(&RetryPolicy{Attempts: 5}).When(failed, Do(func(out Outcome) (string, error) {
+				if !errors.Is(out.Err, failure) {
+					return "", fmt.Errorf("unexpected route error: %w", out.Err)
 				}
 				return "recovered", nil
-			})
+			}))
 			result, err := f.StartWithResult()
 			if err != nil || !reflect.DeepEqual(result, []interface{}{"recovered"}) || calls != permanentAt {
 				t.Fatalf("result=%v error=%v calls=%d", result, err, calls)
@@ -122,19 +122,19 @@ func TestFlowm_TimeoutPolicy_BoundsRateLimitWait(t *testing.T) {
 	}
 }
 
-func TestFlowm_TimeoutPolicy_CancelsActionAndAllowsFallback(t *testing.T) {
+func TestFlowm_TimeoutPolicy_CancelsActionAndAllowsRecovery(t *testing.T) {
 	done := make(chan error, 1)
 	f := New()
 	f.Do(func(ctx context.Context) error {
 		<-ctx.Done()
 		done <- ctx.Err()
 		return ctx.Err()
-	}).With(&TimeoutPolicy{PerAttempt: 15 * time.Millisecond}).OnError(func(ctx context.Context, err error) (string, error) {
-		if ctx.Err() != nil || !errors.Is(err, context.DeadlineExceeded) {
-			return "", fmt.Errorf("fallback context=%v error=%v", ctx.Err(), err)
+	}).With(&TimeoutPolicy{PerAttempt: 15 * time.Millisecond}).When(failed, Do(func(ctx context.Context, out Outcome) (string, error) {
+		if ctx.Err() != nil || !errors.Is(out.Err, context.DeadlineExceeded) {
+			return "", fmt.Errorf("branch context=%v error=%v", ctx.Err(), out.Err)
 		}
 		return "cached", nil
-	})
+	}))
 	result, err := f.StartWithResult()
 	if err != nil || !reflect.DeepEqual(result, []interface{}{"cached"}) {
 		t.Fatalf("result=%v error=%v", result, err)
@@ -149,10 +149,10 @@ func TestFlowm_TimeoutPolicy_CancelsActionAndAllowsFallback(t *testing.T) {
 	}
 }
 
-func TestFlowm_Parallel_SharedRetryAndFallback(t *testing.T) {
+func TestFlowm_Parallel_SharedRetryAndBranch(t *testing.T) {
 	const count = 16
 	retry := &RetryPolicy{Attempts: 2}
-	fallback := &FallbackPolicy{Func: func(err error) string { return err.Error() }}
+	branch := Do(func(out Outcome) string { return out.Err.Error() })
 	var calls [count]atomic.Int32
 	actions := make([]Action, count)
 	want := make([]interface{}, count)
@@ -161,7 +161,7 @@ func TestFlowm_Parallel_SharedRetryAndFallback(t *testing.T) {
 		actions[i] = Do(func() error {
 			calls[i].Add(1)
 			return fmt.Errorf("%d", i)
-		}).With(retry, fallback)
+		}).With(retry).When(failed, branch)
 	}
 	f := New()
 	f.AddParallel(actions...)
@@ -176,10 +176,11 @@ func TestFlowm_Parallel_SharedRetryAndFallback(t *testing.T) {
 	}
 }
 
-func TestFlowm_Parallel_ContinueOnErrorFiltersPipedErrors(t *testing.T) {
+func TestFlowm_Parallel_RecoveryPreservesChosenValues(t *testing.T) {
 	f := New()
 	f.AddParallel(
-		Do(func() (int, error) { return 7, errors.New("ignored") }).With(&ContinueOnErrorPolicy{Continue: true}),
+		Do(func() (int, error) { return 7, errors.New("ignored") }).When(failed,
+			Do(func(out Outcome) int { return out.Values[0].(int) })),
 		Do(func() int { return 9 }),
 	).PipeAll()
 	f.Do(func(a, b int) int { return a + b })
@@ -211,77 +212,6 @@ func TestFlowm_PipingDoesNotMutateActionParams(t *testing.T) {
 		if err != nil || !reflect.DeepEqual(result, []interface{}{5}) || params[1] != "preserve" {
 			t.Fatalf("result=%v error=%v params=%v", result, err, params)
 		}
-	}
-}
-
-func TestFlowm_When_UsesPreviousResult(t *testing.T) {
-	for _, score := range []int{50, 95} {
-		t.Run(fmt.Sprint(score), func(t *testing.T) {
-			f := New()
-			var ran bool
-			f.Do(func() int { return score }).PipeAll()
-			f.Do(func(value int) int {
-				ran = true
-				return value + 1
-			}).When(func(values []interface{}) bool {
-				return values[0].(int) > 90
-			}).PipeAll()
-			f.Do(func(value int) int { return value })
-			result, err := f.StartWithResult()
-			want := score
-			if score > 90 {
-				want++
-			}
-			if err != nil || !reflect.DeepEqual(result, []interface{}{want}) || ran != (score > 90) {
-				t.Fatalf("result=%v error=%v ran=%v; expected score %d", result, err, ran, want)
-			}
-		})
-	}
-}
-
-func TestFlowm_When_SkippedActionDoesNotRunPoliciesOrReplaceResult(t *testing.T) {
-	f := New()
-	var logs []string
-	f.Do(func() int { return 42 }).PipeAll()
-	f.Do(func(int) { t.Fatal("skipped action ran") }).
-		With(logPolicy{logs: &logs}).
-		OnError(func(error) { t.Fatal("skipped fallback ran") }).
-		When(func([]interface{}) bool { return false })
-	result, err := f.StartWithResult()
-	if err != nil || !reflect.DeepEqual(result, []interface{}{42}) || len(logs) != 0 {
-		t.Fatalf("result=%v error=%v policies=%v", result, err, logs)
-	}
-}
-
-func TestFlowm_When_WithoutPipedValues(t *testing.T) {
-	f := New()
-	var ran bool
-	f.Do(func(value int) { ran = value == 7 }, 7).When(func(values []interface{}) bool {
-		if values != nil {
-			t.Fatalf("expected nil piped values, got %v", values)
-		}
-		return true
-	})
-	if err := f.Start(); err != nil || !ran {
-		t.Fatalf("error=%v ran=%v", err, ran)
-	}
-}
-
-func TestFlowm_When_EvaluatedOnceBeforeRetries(t *testing.T) {
-	checks, calls := 0, 0
-	f := New()
-	f.Do(func() error {
-		calls++
-		if calls == 1 {
-			return errors.New("retry")
-		}
-		return nil
-	}).When(func([]interface{}) bool {
-		checks++
-		return true
-	}).With(&RetryPolicy{Attempts: 2})
-	if err := f.Start(); err != nil || checks != 1 || calls != 2 {
-		t.Fatalf("error=%v checks=%d calls=%d", err, checks, calls)
 	}
 }
 
