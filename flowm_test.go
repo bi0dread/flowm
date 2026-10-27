@@ -55,7 +55,15 @@ var _ Policy = logPolicy{}
 func TestFlowm_BasicExecution(t *testing.T) {
 	f := New()
 
-	f.AddAction(Do(mockSuccess, "World"))
+	task := func() error { return errors.New("jump to step 2") }
+	f.Do(task).When(func(out Outcome) Action {
+		if out.Err != nil {
+			return Jump("step-2")
+		}
+		return NoAction()
+	})
+
+	f.AddAction(Do(mockSuccess, "World").Named("step-2"))
 	f.AddAction(Do(mockError))
 
 	err := f.Start()
@@ -213,8 +221,18 @@ func TestFlowm_CircuitBreaker_Open(t *testing.T) {
 		return errors.New("fail")
 	}
 	f := New()
-	f.AddAction(Do(bad).With(cb).When(failed, Do(func() {})))
-	f.AddAction(Do(bad).With(cb).When(failed, Do(func() {})))
+	f.AddAction(Do(bad).With(cb).When(func(out Outcome) Action {
+		if failed(out) {
+			return Do(func() {})
+		}
+		return NoAction()
+	}))
+	f.AddAction(Do(bad).With(cb).When(func(out Outcome) Action {
+		if failed(out) {
+			return Do(func() {})
+		}
+		return NoAction()
+	}))
 	f.AddAction(Do(bad).With(cb))
 	err := f.Start()
 	if err == nil {
@@ -378,7 +396,12 @@ func TestFlowm_DoStyleAction_PoliciesAndRouting(t *testing.T) {
 	collect := func(dst *[]string, a, b string) { *dst = append(*dst, a, b) }
 	f.AddParallel(
 		Do(good),
-		Do(bad).When(failed, Do(fallback)),
+		Do(bad).When(func(out Outcome) Action {
+			if failed(out) {
+				return Do(fallback)
+			}
+			return NoAction()
+		}),
 	).PipeAll()
 	f.AddAction(Do(collect, &got))
 	f.Do(rc.failUntil, 2).With(retry) // chained policy on the flow builder still works
@@ -508,7 +531,12 @@ func TestFlowm_WhenEmptyRecovery_ClearsValuesAndContinues(t *testing.T) {
 	var ran bool
 	bad := func() (int, error) { return 7, errors.New("x") }
 	good := func() { ran = true }
-	f.Do(bad).When(failed, Do(func() {})).PipeAll()
+	f.Do(bad).When(func(out Outcome) Action {
+		if failed(out) {
+			return Do(func() {})
+		}
+		return NoAction()
+	}).PipeAll()
 	f.AddAction(Do(good))
 	if err := f.Start(); err != nil {
 		t.Fatal(err)

@@ -35,6 +35,7 @@ func parallelLimit(action Action) (int, error) {
 func (f *flowm) runParallel(ctx context.Context, actions []Action, limit int) ([]interface{}, error) {
 	group := *f
 	group.ctx = ctx
+	group.inParallel = true
 	type outcome struct {
 		values []interface{}
 		err    error
@@ -68,8 +69,8 @@ func (f *flowm) runParallel(ctx context.Context, actions []Action, limit int) ([
 					out[i].err = &ActionError{Name: name, Err: err}
 					continue
 				}
-				values, err, _, _ := group.runSingleAction(stub{Name: name, Action: actions[i]})
-				out[i] = outcome{values: values, err: err}
+				result, _, _ := group.runSingleAction(stub{Name: name, Action: actions[i]})
+				out[i] = outcome{values: result.Values, err: result.failure()}
 			}
 		}()
 	}

@@ -12,20 +12,42 @@ func Example_outcomeRouting() {
 		OnSkip: func(name string) { fmt.Println("skipped:", name) },
 	})
 	f.Do(func() int { return 50 }).Named("fetch-score").When(
-		func(out flowm.Outcome) bool { return out.Err == nil && out.Values[0].(int) > 90 },
-		flowm.Do(func(out flowm.Outcome) int {
-			score := out.Values[0].(int)
-			fmt.Println("alert:", score)
-			return score
-		}).Named("high-score-alert"),
+		func(out flowm.Outcome) flowm.Action {
+			if out.Err == nil && out.Values[0].(int) > 90 {
+				return flowm.Do(func(out flowm.Outcome) int {
+					score := out.Values[0].(int)
+					fmt.Println("alert:", score)
+					return score
+				}).Named("high-score-alert")
+			}
+			return flowm.NoAction()
+		},
 	).PipeAll()
 	f.Do(func(score int) { fmt.Println("score:", score) })
 	if err := f.Start(); err != nil {
 		panic(err)
 	}
 	// Output:
-	// skipped: high-score-alert
+	// skipped: fetch-score
 	// score: 50
+}
+
+func ExampleJump() {
+	f := flowm.New().WithMaxJumps(10)
+	f.Do(func() int { return 0 }).PipeAll()
+	f.Do(func(n int) int { return n + 1 }).Named("increment").When(
+		func(out flowm.Outcome) flowm.Action {
+			if out.Err == nil && out.Values[0].(int) < 3 {
+				return flowm.Jump("increment")
+			}
+			return flowm.NoAction()
+		},
+	).PipeAll()
+	f.Do(func(n int) { fmt.Println(n) })
+	if err := f.Start(); err != nil {
+		panic(err)
+	}
+	// Output: 3
 }
 
 func Example_validation() {

@@ -22,12 +22,17 @@ func TestFlowm_PermanentError_ReachesRoute(t *testing.T) {
 					return fmt.Errorf("wrapped: %w", Permanent(failure))
 				}
 				return errors.New("transient")
-			}).With(&RetryPolicy{Attempts: 5}).When(failed, Do(func(out Outcome) (string, error) {
-				if !errors.Is(out.Err, failure) {
-					return "", fmt.Errorf("unexpected route error: %w", out.Err)
+			}).With(&RetryPolicy{Attempts: 5}).When(func(out Outcome) Action {
+				if failed(out) {
+					return Do(func(out Outcome) (string, error) {
+						if !errors.Is(out.Err, failure) {
+							return "", fmt.Errorf("unexpected route error: %w", out.Err)
+						}
+						return "recovered", nil
+					})
 				}
-				return "recovered", nil
-			}))
+				return NoAction()
+			})
 			result, err := f.StartWithResult()
 			if err != nil || !reflect.DeepEqual(result, []interface{}{"recovered"}) || calls != permanentAt {
 				t.Fatalf("result=%v error=%v calls=%d", result, err, calls)
@@ -129,12 +134,17 @@ func TestFlowm_TimeoutPolicy_CancelsActionAndAllowsRecovery(t *testing.T) {
 		<-ctx.Done()
 		done <- ctx.Err()
 		return ctx.Err()
-	}).With(&TimeoutPolicy{PerAttempt: 15 * time.Millisecond}).When(failed, Do(func(ctx context.Context, out Outcome) (string, error) {
-		if ctx.Err() != nil || !errors.Is(out.Err, context.DeadlineExceeded) {
-			return "", fmt.Errorf("branch context=%v error=%v", ctx.Err(), out.Err)
+	}).With(&TimeoutPolicy{PerAttempt: 15 * time.Millisecond}).When(func(out Outcome) Action {
+		if failed(out) {
+			return Do(func(ctx context.Context, out Outcome) (string, error) {
+				if ctx.Err() != nil || !errors.Is(out.Err, context.DeadlineExceeded) {
+					return "", fmt.Errorf("branch context=%v error=%v", ctx.Err(), out.Err)
+				}
+				return "cached", nil
+			})
 		}
-		return "cached", nil
-	}))
+		return NoAction()
+	})
 	result, err := f.StartWithResult()
 	if err != nil || !reflect.DeepEqual(result, []interface{}{"cached"}) {
 		t.Fatalf("result=%v error=%v", result, err)
@@ -161,7 +171,12 @@ func TestFlowm_Parallel_SharedRetryAndBranch(t *testing.T) {
 		actions[i] = Do(func() error {
 			calls[i].Add(1)
 			return fmt.Errorf("%d", i)
-		}).With(retry).When(failed, branch)
+		}).With(retry).When(func(out Outcome) Action {
+			if failed(out) {
+				return branch
+			}
+			return NoAction()
+		})
 	}
 	f := New()
 	f.AddParallel(actions...)
@@ -179,8 +194,12 @@ func TestFlowm_Parallel_SharedRetryAndBranch(t *testing.T) {
 func TestFlowm_Parallel_RecoveryPreservesChosenValues(t *testing.T) {
 	f := New()
 	f.AddParallel(
-		Do(func() (int, error) { return 7, errors.New("ignored") }).When(failed,
-			Do(func(out Outcome) int { return out.Values[0].(int) })),
+		Do(func() (int, error) { return 7, errors.New("ignored") }).When(func(out Outcome) Action {
+			if failed(out) {
+				return Do(func(out Outcome) int { return out.Values[0].(int) })
+			}
+			return NoAction()
+		}),
 		Do(func() int { return 9 }),
 	).PipeAll()
 	f.Do(func(a, b int) int { return a + b })

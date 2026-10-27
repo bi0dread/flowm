@@ -19,6 +19,8 @@ type Action struct {
 	Policies []Policy
 	parallel *parallelGroup
 	routes   []route
+	jump     *jumpTarget
+	defined  bool // distinguishes Do(nil), which is invalid, from no decision
 }
 
 type stub struct {
@@ -30,13 +32,14 @@ type Flowm interface {
 	AddAction(action Action)
 	WithContext(ctx context.Context) Flowm
 	WithHooks(h Hooks) Flowm
+	WithMaxJumps(limit int) Flowm
 	Do(function interface{}, params ...interface{}) Flowm
 	Named(name string) Flowm
 	With(policy Policy) Flowm
 	PipeAll() Flowm
 	Pipe(indices ...int) Flowm
 	Map(mapper func([]interface{}) []interface{}) Flowm
-	When(predicate func(Outcome) bool, action Action) Flowm
+	When(decide func(Outcome) Action) Flowm
 	AddParallel(actions ...Action) Flowm
 	WithConcurrency(limit int) Flowm
 	Validate() error
@@ -49,6 +52,10 @@ type flowm struct {
 	ctx         context.Context
 	hooks       *Hooks
 	lastIndex   int
+	maxJumps    int
+	// Execution-only state is populated on a copy for each run.
+	targets    map[string]int
+	inParallel bool
 }
 
 func New() Flowm {
@@ -57,6 +64,7 @@ func New() Flowm {
 		ctx:         context.Background(),
 		hooks:       &Hooks{},
 		lastIndex:   -1,
+		maxJumps:    defaultMaxJumps,
 	}
 }
 
@@ -73,13 +81,17 @@ func (f *flowm) Start() error {
 // StartWithResult runs the flow and returns the last executed action's
 // non-error return values alongside the flow error.
 func (f *flowm) StartWithResult() ([]interface{}, error) {
-	if err := f.Validate(); err != nil {
+	targets, err := f.validate()
+	if err != nil {
 		return nil, err
 	}
+	run := *f
+	run.targets = targets
 	var pipedValues []interface{}
 	hasPiped := false
 	var lastResult []interface{}
-	for i := range f.stubStorage {
+	jumps := 0
+	for i := 0; i < len(f.stubStorage); {
 		st := f.stubStorage[i]
 		if err := f.ctx.Err(); err != nil {
 			failure := &ActionError{Name: st.Name, Err: err}
@@ -97,14 +109,29 @@ func (f *flowm) StartWithResult() ([]interface{}, error) {
 			hasPiped = false
 			pipedValues = nil
 		}
-		result, err, pipeNext, pipeVals := f.runSingleAction(st)
-		lastResult = result
+		result, pipeNext, pipeVals := run.runSingleAction(st)
+		lastResult = result.Values
 		if pipeNext {
 			pipedValues = pipeVals
 			hasPiped = true
 		}
-		if err != nil {
+		if err := result.failure(); err != nil {
 			return nil, err
+		}
+		if result.jump != nil {
+			if err := f.ctx.Err(); err != nil {
+				result.Err = err
+			} else if jumps >= f.maxJumps {
+				result.Err = fmt.Errorf("%w: limit %d, target %q", ErrJumpLimitExceeded, f.maxJumps, result.jump.name)
+			}
+			if result.Err != nil {
+				f.reportOutcome(result.Outcome)
+				return nil, result.failure()
+			}
+			jumps++
+			i = targets[result.jump.name]
+		} else {
+			i++
 		}
 	}
 	return filterErrorValues(lastResult), nil
@@ -126,10 +153,17 @@ func filterErrorValues(vals []interface{}) []interface{} {
 // chaining With, Named, and When. Intended for
 // AddParallel and anywhere an Action value is needed.
 func Do(function interface{}, params ...interface{}) Action {
-	return Action{Func: function, Params: params}
+	return Action{Func: function, Params: params, defined: true}
 }
 
-// Named returns an action with a name used by errors and hooks.
+// NoAction keeps the source outcome unchanged when returned from a When
+// callback and allows later callbacks to decide. It preserves both values
+// and errors; an error still stops the flow if no later callback handles it.
+func NoAction() Action {
+	return Action{}
+}
+
+// Named returns an action with a name used by errors, hooks, and jump targets.
 // An empty name uses the function's name.
 func (a Action) Named(name string) Action {
 	a.Name = name
@@ -145,12 +179,13 @@ func (a Action) With(policies ...Policy) Action {
 	return a
 }
 
-// When appends an ordered outcome rule and its branch action.
-// Only the first matching rule runs; the branch replaces this action's outcome.
-func (a Action) When(predicate func(Outcome) bool, branch Action) Action {
+// When appends a callback that chooses an action after this action completes.
+// Return Do(...) to run a branch, Jump(name) to transfer control, or NoAction()
+// to keep the outcome and try the next callback. The first choice wins.
+func (a Action) When(decide func(Outcome) Action) Action {
 	rules := make([]route, 0, len(a.routes)+1)
 	rules = append(rules, a.routes...)
-	a.routes = append(rules, route{predicate: predicate, action: branch})
+	a.routes = append(rules, decide)
 	return a
 }
 
@@ -318,21 +353,18 @@ func (f *flowm) executeAction(st stub) (result []interface{}, err error, attempt
 }
 
 // Piping on the originating flow step applies to the selected branch's values.
-func (f *flowm) runSingleAction(st stub) (result []interface{}, err error, pipeNext bool, pipeVals []interface{}) {
-	outcome := f.runAction(st)
-	result, err = outcome.Values, outcome.failure()
+func (f *flowm) runSingleAction(st stub) (result actionResult, pipeNext bool, pipeVals []interface{}) {
+	result = f.runAction(st)
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			result, pipeNext, pipeVals = nil, false, nil
-			err = &ActionError{Name: st.Name, Err: fmt.Errorf("pipe panic: %v", recovered)}
-			if f.hooks != nil && f.hooks.OnError != nil {
-				f.hooks.OnError(st.Name, err)
-			}
+			result = actionResult{Outcome: Outcome{Name: st.Name, Err: fmt.Errorf("pipe panic: %v", recovered)}}
+			pipeNext, pipeVals = false, nil
+			f.reportOutcome(result.Outcome)
 		}
 	}()
-	if err == nil && len(result) > 0 {
+	if result.Err == nil && len(result.Values) > 0 {
 		// prepare values for piping: drop error-typed returns and expand nested []interface{}
-		filtered := filterErrorValues(result)
+		filtered := filterErrorValues(result.Values)
 		// helper to set pipe all semantics
 		setPipeAll := func(vals []interface{}) {
 			if len(vals) == 1 {
@@ -690,12 +722,13 @@ func (f *flowm) Map(mapper func([]interface{}) []interface{}) Flowm {
 	return f.With(&PipeMapPolicy{Mapper: mapper})
 }
 
-// When appends a rule to the last added action. Rules run after its final
-// attempt and policies, in registration order, until the first match.
-func (f *flowm) When(predicate func(Outcome) bool, branch Action) Flowm {
+// When appends a decision callback to the last added action. Callbacks run
+// after its attempts and policies. Return Do(...), Jump(name), or NoAction()
+// to keep the original outcome. The first non-empty decision wins.
+func (f *flowm) When(decide func(Outcome) Action) Flowm {
 	if f.lastIndex >= 0 {
 		st := &f.stubStorage[f.lastIndex]
-		st.Action = st.Action.When(predicate, branch)
+		st.Action = st.Action.When(decide)
 	}
 	return f
 }
@@ -706,7 +739,7 @@ func (f *flowm) AddParallel(actions ...Action) Flowm {
 	return f
 }
 
-// Named sets the last added action's name for errors and hooks.
+// Named sets the last added action's name for errors, hooks, and jump targets.
 func (f *flowm) Named(name string) Flowm {
 	if f.lastIndex >= 0 {
 		st := &f.stubStorage[f.lastIndex]
@@ -728,6 +761,9 @@ func actionName(action Action) string {
 	}
 	if action.parallel != nil {
 		return "parallel"
+	}
+	if action.jump != nil {
+		return "jump:" + action.jump.name
 	}
 	return functionNameOf(action.Func)
 }

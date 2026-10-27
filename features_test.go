@@ -38,10 +38,8 @@ func TestValidate_RejectsDefinitionsBeforeSideEffects(t *testing.T) {
 		{"rate interval", func(f Flowm) { f.Do(func() {}).With(&RateLimitPolicy{Burst: 1}) }},
 		{"rate burst", func(f Flowm) { f.Do(func() {}).With(&RateLimitPolicy{Per: time.Second}) }},
 		{"breaker", func(f Flowm) { f.Do(func() {}).With(&CircuitBreakerPolicy{}) }},
-		{"nil branch", func(f Flowm) { f.Do(func() {}).When(failed, Do(nil)) }},
-		{"branch arguments", func(f Flowm) { f.Do(func() {}).When(failed, Do(func(Outcome, int) {})) }},
-		{"nil predicate", func(f Flowm) { f.Do(func() {}).When(nil, Do(func() {})) }},
-		{"branch piping", func(f Flowm) { f.Do(func() {}).When(failed, Do(func() {}).With(&PipeAllPolicy{})) }},
+		{"nil callback", func(f Flowm) { f.Do(func() {}).When(nil) }},
+		{"typed nil callback", func(f Flowm) { f.Do(func() {}).When((func(Outcome) Action)(nil)) }},
 		{"negative pipe index", func(f Flowm) { f.Do(func() {}).Pipe(-1) }},
 		{"nil mapper", func(f Flowm) { f.Do(func() {}).Map(nil) }},
 		{"concurrency on action", func(f Flowm) { f.Do(func() {}).WithConcurrency(2) }},
@@ -76,8 +74,10 @@ func TestValidate_DoesNotInvokeUserCode(t *testing.T) {
 	f := New()
 	f.Do(func() int { t.Fatal("action called"); return 1 }).
 		With(&RetryPolicy{Attempts: 2, RetryIf: func(error) bool { t.Fatal("retry predicate called"); return false }}).
-		When(func(Outcome) bool { t.Fatal("route predicate called"); return true },
-			Do(func(Outcome) int { t.Fatal("branch called"); return 2 })).
+		When(func(Outcome) Action {
+			t.Fatal("route predicate called")
+			return Do(func(Outcome) int { t.Fatal("branch called"); return 2 })
+		}).
 		Map(func([]interface{}) []interface{} { t.Fatal("mapper called"); return nil })
 	f.Do(func(int) {})
 	if err := f.Validate(); err != nil {

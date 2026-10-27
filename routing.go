@@ -9,7 +9,7 @@ import (
 // Outcome is the completed result of one action after its attempts and policies.
 // Values contains non-error returns from the final attempt. Err is the underlying
 // error, nil on success. Attempts counts calls to this action, not its branches.
-// Predicates should treat Values and the objects it contains as read-only.
+// Decision callbacks should treat Values and its contents as read-only.
 type Outcome struct {
 	Name     string
 	Values   []interface{}
@@ -17,9 +17,17 @@ type Outcome struct {
 	Attempts int
 }
 
-type route struct {
-	predicate func(Outcome) bool
-	action    Action
+type route func(Outcome) Action
+
+func (a Action) empty() bool {
+	return !a.defined && a.Name == "" && a.Func == nil && len(a.Params) == 0 &&
+		len(a.Policies) == 0 && len(a.routes) == 0 && a.parallel == nil && a.jump == nil
+}
+
+// A jump is execution control, not an action error or a user return value.
+type actionResult struct {
+	Outcome
+	jump *jumpTarget
 }
 
 var outcomeType = reflect.TypeOf(Outcome{})
@@ -44,54 +52,71 @@ func (f *flowm) reportOutcome(outcome Outcome) {
 	}
 }
 
-func (f *flowm) runAction(st stub) Outcome {
-	values, err, attempts := f.executeAction(st)
-	outcome := Outcome{Name: st.Name, Values: filterErrorValues(values), Err: err, Attempts: attempts}
-	if canceled := f.ctx.Err(); canceled != nil {
-		if !errors.Is(outcome.Err, canceled) {
-			outcome.Err = errors.Join(outcome.Err, canceled)
+func (f *flowm) runAction(st stub) actionResult {
+actionLoop:
+	for {
+		values, err, attempts := f.executeAction(st)
+		outcome := Outcome{Name: st.Name, Values: filterErrorValues(values), Err: err, Attempts: attempts}
+		if canceled := f.ctx.Err(); canceled != nil {
+			if !errors.Is(outcome.Err, canceled) {
+				outcome.Err = errors.Join(outcome.Err, canceled)
+			}
+			f.reportOutcome(outcome)
+			return actionResult{Outcome: outcome}
 		}
 		f.reportOutcome(outcome)
-		return outcome
-	}
-	f.reportOutcome(outcome)
-	for _, rule := range st.Action.routes {
-		name := actionName(rule.action)
-		if canceled := f.ctx.Err(); canceled != nil {
-			return f.routingFailure(name, outcome.Err, canceled)
-		}
-		matched, predicateErr := matchOutcome(rule.predicate, outcome)
-		if predicateErr != nil {
-			return f.routingFailure(name, outcome.Err, predicateErr)
-		}
-		if canceled := f.ctx.Err(); canceled != nil {
-			return f.routingFailure(name, outcome.Err, canceled)
-		}
-		if !matched {
-			if f.hooks != nil && f.hooks.OnSkip != nil {
-				f.hooks.OnSkip(name)
+		for _, decide := range st.Action.routes {
+			if canceled := f.ctx.Err(); canceled != nil {
+				return f.routingFailure(st.Name, outcome.Err, canceled)
 			}
-			continue
+			branch, decisionErr := decideOutcome(decide, outcome)
+			if decisionErr != nil {
+				return f.routingFailure(st.Name, outcome.Err, decisionErr)
+			}
+			if canceled := f.ctx.Err(); canceled != nil {
+				return f.routingFailure(st.Name, outcome.Err, canceled)
+			}
+			if branch.empty() {
+				if f.hooks != nil && f.hooks.OnSkip != nil {
+					f.hooks.OnSkip(st.Name)
+				}
+				continue
+			}
+			name := actionName(branch)
+			if branch.jump != nil {
+				if err := f.validateJump(branch); err != nil {
+					return f.routingFailure(name, outcome.Err, err)
+				}
+				outcome.Err = nil
+				return actionResult{Outcome: outcome, jump: branch.jump}
+			}
+			if hasPiping(branch) {
+				return f.routingFailure(name, outcome.Err, errors.New("put piping on the source step, not the returned action"))
+			}
+			branch = bindOutcome(branch, outcome)
+			if err := validateAction(branch, false, false); err != nil {
+				return f.routingFailure(name, outcome.Err, err)
+			}
+			st = stub{Name: name, Action: branch}
+			continue actionLoop
 		}
-		branch := bindOutcome(rule.action, outcome)
-		return f.runAction(stub{Name: name, Action: branch})
+		return actionResult{Outcome: outcome}
 	}
-	return outcome
 }
 
-func (f *flowm) routingFailure(name string, original, err error) Outcome {
+func (f *flowm) routingFailure(name string, original, err error) actionResult {
 	outcome := Outcome{Name: name, Err: errors.Join(original, err)}
 	f.reportOutcome(outcome)
-	return outcome
+	return actionResult{Outcome: outcome}
 }
 
-func matchOutcome(predicate func(Outcome) bool, outcome Outcome) (matched bool, err error) {
+func decideOutcome(decide func(Outcome) Action, outcome Outcome) (action Action, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("When predicate panic: %v", recovered)
+			err = fmt.Errorf("When callback panic: %v", recovered)
 		}
 	}()
-	return predicate(outcome), nil
+	return decide(outcome), nil
 }
 
 // A branch may request Outcome as its first parameter after an optional context.
@@ -99,7 +124,7 @@ func matchOutcome(predicate func(Outcome) bool, outcome Outcome) (matched bool, 
 func bindOutcome(action Action, outcome Outcome) Action {
 	t, err := functionType(action.Func)
 	if err != nil {
-		return action // preflight reports invalid branch definitions
+		return action // validation reports invalid branch definitions
 	}
 	position, argument := 0, 0
 	if t.NumIn() > 0 && t.In(0) == contextType {

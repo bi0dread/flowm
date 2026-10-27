@@ -14,19 +14,30 @@ var (
 )
 
 // Validate checks all action definitions, explicit arguments, built-in policy
-// settings, routes, and parallel members without invoking them. Piped arguments
-// are checked at runtime, since maps and routes can change their types and
-// counts. Start calls Validate automatically.
+// settings, callbacks, and parallel members without invoking them. Returned
+// actions, jump targets, and dynamic piped arguments are checked at runtime.
+// Start calls Validate automatically.
 func (f *flowm) Validate() error {
-	var errs []error
+	_, err := f.validate()
+	return err
+}
+
+func (f *flowm) validate() (map[string]int, error) {
+	targets, errs := f.indexTargets()
+	// A callback can return any named jump target, including from a nested
+	// branch. If its source pipes values, named targets may receive them.
+	dynamicPiping := false
+	for _, st := range f.stubStorage {
+		dynamicPiping = dynamicPiping || (len(st.Action.routes) > 0 && hasPiping(st.Action))
+	}
 	mayReceiveValues := false
 	for _, st := range f.stubStorage {
-		if err := validateAction(st.Action, mayReceiveValues, false); err != nil {
+		if err := validateAction(st.Action, mayReceiveValues || (dynamicPiping && st.Action.Name != ""), false); err != nil {
 			errs = append(errs, err)
 		}
 		mayReceiveValues = hasPiping(st.Action)
 	}
-	return errors.Join(errs...)
+	return targets, errors.Join(errs...)
 }
 
 func hasPiping(action Action) bool {
@@ -45,6 +56,9 @@ func validateAction(action Action, mayReceiveValues, parallelMember bool) (err e
 			err = &ActionError{Name: actionName(action), Err: err}
 		}
 	}()
+	if action.jump != nil {
+		return errors.New("Jump must be returned from a When callback")
+	}
 	if action.parallel == nil {
 		if _, err := prepareArguments(action.Func, action.Params, context.Background(), mayReceiveValues); err != nil {
 			return err
@@ -106,15 +120,9 @@ func validateAction(action Action, mayReceiveValues, parallelMember bool) (err e
 			}
 		}
 	}
-	for _, rule := range action.routes {
-		if rule.predicate == nil {
-			return fmt.Errorf("When branch %q requires a non-nil predicate", actionName(rule.action))
-		}
-		if hasPiping(rule.action) {
-			return fmt.Errorf("put piping on the source step, not When branch %q", actionName(rule.action))
-		}
-		if err := validateAction(bindOutcome(rule.action, Outcome{}), false, false); err != nil {
-			return fmt.Errorf("When branch: %w", err)
+	for _, decide := range action.routes {
+		if decide == nil {
+			return errors.New("When requires a non-nil callback")
 		}
 	}
 	if action.parallel != nil {
